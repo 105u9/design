@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HVAC &#26234;&#33021;&#25511;&#21046;&#30417;&#25511;&#22823;&#23631;</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        body { font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; background: #fff; padding: 15px 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        .dashboard { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
+        .card { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); height: 400px; }
+        .card-title { font-size: 1.2rem; font-weight: bold; margin-bottom: 15px; color: #333; }
+        
+        /* Switch styling */
+        .switch-container { display: flex; align-items: center; gap: 10px; }
+        .switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #4caf50; }
+        input:focus + .slider { box-shadow: 0 0 1px #4caf50; }
+        input:checked + .slider:before { transform: translateX(26px); }
+        .status-text { font-weight: bold; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>HVAC &#26234;&#33021;&#25511;&#21046;&#30417;&#25511;&#22823;&#23631;</h1>
+        <div class="switch-container">
+            <span class="status-text">AI &#25511;&#21046;&#27169;&#24335;</span>
+            <label class="switch">
+                <input type="checkbox" id="aiToggle" checked onchange="handleToggle(this.checked)">
+                <span class="slider"></span>
+            </label>
+            <span id="aiStatus" style="color: #4caf50; font-weight: bold;">&#24320;&#21551;</span>
+        </div>
+    </div>
+
+    <div class="dashboard">
+        <div class="card">
+            <div class="card-title">&#23454;&#26102;&#29615;&#22659;&#30417;&#27979; (&#28201;&#24230; & &#28287;&#24230;)</div>
+            <div id="envChart" style="width: 100%; height: 350px;"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">&#23454;&#26102;&#33021;&#32791;&#36235;&#21183; (kW)</div>
+            <div id="energyChart" style="width: 100%; height: 350px;"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">&#26410;&#26469; 12 &#23567;&#26102;&#36127;&#33655;&#39044;&#27979; (LSTM)</div>
+            <div id="predictChart" style="width: 100%; height: 350px;"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">AI &#20248;&#21270;&#35774;&#23450;&#20540;&#24314;&#35758; (MOPSO)</div>
+            <div id="controlChart" style="width: 100%; height: 350px;"></div>
+        </div>
+    </div>
+
+    <script>
+        const TOKEN = "fake-super-secret-token";
+        const headers = { 
+            'Authorization': `Bearer ${TOKEN}`,
+            'Content-Type': 'application/json'
+        };
+
+        // Initialize charts once
+        const envChart = echarts.init(document.getElementById('envChart'));
+        const energyChart = echarts.init(document.getElementById('energyChart'));
+        const predictChart = echarts.init(document.getElementById('predictChart'));
+        const controlChart = echarts.init(document.getElementById('controlChart'));
+
+        async function handleToggle(checked) {
+            try {
+                const res = await fetch(`/api/v1/toggle_ai?mode=${checked}`, {
+                    method: 'POST',
+                    headers: headers
+                });
+                const data = await res.json();
+                updateStatusUI(data.ai_mode);
+            } catch (err) {
+                console.error("Toggle failed", err);
+            }
+        }
+
+        function updateStatusUI(isAiEnabled) {
+            const statusEl = document.getElementById('aiStatus');
+            const toggleEl = document.getElementById('aiToggle');
+            toggleEl.checked = isAiEnabled;
+            if (isAiEnabled) {
+                statusEl.innerText = "\u5df2\u5f00\u542f"; // "已开启"
+                statusEl.style.color = "#4caf50";
+            } else {
+                statusEl.innerText = "\u5df2\u5173\u95ed"; // "已关闭"
+                statusEl.style.color = "#f44336";
+            }
+        }
+
+        async function fetchData() {
+            try {
+                const res = await fetch('/api/v1/monitoring', { headers });
+                const data = await res.json();
+                
+                const predRes = await fetch('/api/v1/predict', { method: 'POST', headers });
+                const predData = await predRes.json();
+
+                updateStatusUI(data.system.ai_mode);
+                updateCharts(data.history, predData);
+            } catch (err) {
+                console.error("Data fetch failed", err);
+            }
+        }
+
+        function updateCharts(history, prediction) {
+            // Environment Chart
+            envChart.setOption({
+                tooltip: { 
+                    trigger: 'axis',
+                    formatter: function(params) {
+                        let res = params[0].name + '<br/>';
+                        params.forEach(item => {
+                            res += item.marker + item.seriesName + ': ' + item.value.toFixed(1) + (item.seriesName.includes('\u6e29') ? ' \u2103' : ' %') + '<br/>';
+                        });
+                        return res;
+                    }
+                },
+                legend: { data: ['\u6e29\u5ea6', '\u6e7f\u5ea6'] },
+                xAxis: { type: 'category', data: history.map(d => d.timestamp.split(' ')[1]) },
+                yAxis: { type: 'value' },
+                series: [
+                    { name: '\u6e29\u5ea6', type: 'line', data: history.map(d => d.temperature), smooth: true, color: '#ff7043' },
+                    { name: '\u6e7f\u5ea6', type: 'line', data: history.map(d => d.humidity), smooth: true, color: '#26c6da' }
+                ]
+            });
+
+            // Energy Chart
+            energyChart.setOption({
+                tooltip: { 
+                    trigger: 'axis',
+                    formatter: '{b}<br/>{a}: {c} kW'
+                },
+                xAxis: { type: 'category', data: history.map(d => d.timestamp.split(' ')[1]) },
+                yAxis: { type: 'value' },
+                series: [{ name: '\u33021\u32791', type: 'bar', data: history.map(d => d.power), color: '#5c6bc0' }]
+            });
+
+            // Prediction Chart
+            predictChart.setOption({
+                tooltip: { 
+                    trigger: 'axis',
+                    formatter: '{b}<br/>{a}: {c} kW'
+                },
+                xAxis: { type: 'category', data: prediction.forecast_horizon },
+                yAxis: { type: 'value' },
+                series: [{ name: '\u39044\u27979\u36127\u33655', type: 'line', lineStyle: { type: 'dashed' }, data: prediction.predicted_load, color: '#66bb6a' }]
+            });
+
+            // AI Control Chart
+            controlChart.setOption({
+                tooltip: { 
+                    trigger: 'item',
+                    formatter: '{a}<br/>{b}: {c} \u2103'
+                },
+                series: [{
+                    type: 'gauge',
+                    name: 'AI \u20248\u21270\u63a8\u8350', // "AI 优化推荐"
+                    startAngle: 180,
+                    endAngle: 0,
+                    min: 18,
+                    max: 26,
+                    itemStyle: { color: '#ff9800' },
+                    progress: { show: true, width: 8 },
+                    pointer: { show: true },
+                    axisTick: { show: false },
+                    axisLabel: { distance: -40, color: '#999', fontSize: 12 },
+                    data: [{ 
+                        value: 22.5, 
+                        name: '\u63a8\u8350\u6e29\u5ea6' // "推荐温度"
+                    }]
+                }]
+            });
+        }
+
+        fetchData();
+        setInterval(fetchData, 5000);
+    </script>
+</body>
+</html>
