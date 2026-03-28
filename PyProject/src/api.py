@@ -6,6 +6,8 @@ from pydantic import BaseModel
 from typing import List, Dict
 import numpy as np
 import torch
+import joblib
+import pandas as pd
 import time
 import logging
 from datetime import datetime, timedelta
@@ -16,6 +18,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models import LSTM_ED_Model
 from optimization import MOPSO
+from preprocessing import load_building_data, clean_and_impute, normalize_data
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +29,26 @@ app = FastAPI(
     description="Backend API for real-time HVAC monitoring and optimization",
     version="2.0.0"
 )
+
+# Load global scaler and model
+scaler = None
+if os.path.exists("src/data_scaler.pkl"):
+    scaler = joblib.load("src/data_scaler.pkl")
+    logger.info("Loaded scaler from src/data_scaler.pkl")
+
+model_instance = None
+try:
+    # Load trained model
+    input_size = 8 # BDG2 numeric features
+    hidden_size = 64
+    output_size = 1
+    forecast_len = 12
+    model_instance = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len)
+    if os.path.exists("src/lstm_model.pth"):
+        model_instance.load_state_dict(torch.load("src/lstm_model.pth"))
+    model_instance.eval()
+except Exception as e:
+    logger.warning(f"Could not load LSTM model: {e}")
 
 # Authentication logic (Simulated for Phase 5)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -146,49 +169,44 @@ def collect_data(data: SensorData, current_user: dict = Depends(get_current_user
     logger.info(f"Received data: {data}")
     return {"status": "success", "received_at": datetime.now().isoformat()}
 
-# Global Model Reference
-model_instance = None
-try:
-    # Load trained model
-    input_size = 8 # BDG2 numeric features
-    hidden_size = 64
-    output_size = 1
-    forecast_len = 12
-    model_instance = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len)
-    if os.path.exists("src/lstm_model.pth"):
-        model_instance.load_state_dict(torch.load("src/lstm_model.pth"))
-    model_instance.eval()
-except Exception as e:
-    logger.warning(f"Could not load LSTM model: {e}")
-
 @app.post("/api/v1/predict", response_model=PredictionResponse)
 def predict_load(current_user: dict = Depends(get_current_user)):
     """Predict load using LSTM model (Model layer)"""
     now = datetime.now()
     forecast_horizon = [(now + timedelta(hours=i)).strftime("%H:00") for i in range(1, 13)]
     
-    if model_instance:
+    if model_instance and scaler:
         try:
             # Use real recent data from BDG2 if available
             if len(real_samples) >= 24:
-                # Get last 24 records, convert to numeric and normalize (simplified)
-                recent_data = pd.DataFrame(real_samples[-24:]).select_dtypes(include=[np.number]).values
-                input_tensor = torch.FloatTensor(recent_data).unsqueeze(0) # [1, 24, num_features]
+                # Get last 24 records, filter numeric features
+                recent_df = pd.DataFrame(real_samples[-24:]).select_dtypes(include=[np.number])
+                
+                # IMPORTANT: Normalize input using the trained scaler
+                recent_data_scaled = scaler.transform(recent_df)
+                input_tensor = torch.FloatTensor(recent_data_scaled).unsqueeze(0) # [1, 24, num_features]
+                
+                with torch.no_grad():
+                    pred = model_instance(input_tensor) # Output shape: [1, 12, 1]
+                
+                # Get raw predicted values
+                predicted_load_scaled = pred[0, :, 0].detach().cpu().numpy()
+                
+                # Inverse transform to get real power usage (kW)
+                # We need a dummy array with the same shape as input features to use inverse_transform
+                dummy_pred = np.zeros((12, recent_df.shape[1]))
+                target_idx = recent_df.columns.get_loc('power_usage')
+                dummy_pred[:, target_idx] = predicted_load_scaled
+                
+                predicted_real = scaler.inverse_transform(dummy_pred)[:, target_idx]
+                predicted_load = [float(val) for val in predicted_real]
             else:
-                input_tensor = torch.zeros(1, 24, 8) 
-            
-            with torch.no_grad():
-                pred = model_instance(input_tensor)
-            
-            # Use the first feature (power_usage) from prediction
-            predicted_load_raw = pred[0, :, 0].tolist()
-            
-            # Rescale back to kW (approximate for demo)
-            predicted_load = [float(p * 100 + 150) for p in predicted_load_raw]
+                raise ValueError("Not enough real samples for prediction")
         except Exception as e:
             logger.error(f"Prediction failed: {e}")
             predicted_load = [float(150 + 50 * np.sin(i/3) + np.random.uniform(-5, 5)) for i in range(12)]
     else:
+        # Fallback if model or scaler not loaded
         predicted_load = [float(150 + 50 * np.sin(i/3) + np.random.uniform(-5, 5)) for i in range(12)]
         
     return PredictionResponse(forecast_horizon=forecast_horizon, predicted_load=predicted_load)

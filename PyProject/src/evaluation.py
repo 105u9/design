@@ -5,6 +5,12 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from optimization import MOPSO
 
+def calculate_metrics(y_true, y_pred):
+    """Calculate RMSE and MAPE for model evaluation"""
+    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+    mape = np.mean(np.abs((y_true - y_pred) / np.where(y_true == 0, 1e-10, y_true))) * 100
+    return rmse, mape
+
 def run_backtest(model, X_test, y_test, scaler, steps=24):
     """
     Perform a data-driven backtest on the test set.
@@ -12,6 +18,32 @@ def run_backtest(model, X_test, y_test, scaler, steps=24):
     """
     model.eval()
     
+    # 0. Initial model error evaluation
+    with torch.no_grad():
+        preds_scaled = model(X_test[:steps]).cpu().numpy() # [steps, forecast_len, 1]
+        y_true_scaled = y_test[:steps].cpu().numpy() # [steps, forecast_len, 1]
+        
+        # De-normalize for real error calculation
+        num_features = X_test.shape[2]
+        dummy_true = np.zeros((steps * 12, num_features))
+        dummy_pred = np.zeros((steps * 12, num_features))
+        
+        # Assume power_usage is the target column
+        # In a real scenario, we'd need the column index from the dataframe
+        # Here we'll assume index 0 for power_usage or use a common fallback
+        target_idx = 0 
+        
+        dummy_true[:, target_idx] = y_true_scaled.flatten()
+        dummy_pred[:, target_idx] = preds_scaled.flatten()
+        
+        y_real = scaler.inverse_transform(dummy_true)[:, target_idx]
+        y_pred = scaler.inverse_transform(dummy_pred)[:, target_idx]
+        
+        rmse, mape = calculate_metrics(y_real, y_pred)
+        print(f"\nModel Performance on Test Set (First {steps} windows):")
+        print(f" - RMSE: {rmse:.4f} kW")
+        print(f" - MAPE: {mape:.2f}%")
+
     # Storage for results
     ai_setpoints = []
     ai_energy = []
@@ -21,37 +53,36 @@ def run_backtest(model, X_test, y_test, scaler, steps=24):
     baseline_energy = []
     baseline_comfort = []
     
-    print(f"Starting CSV-based Backtest for {steps} steps...")
+    print(f"\nStarting CSV-based Backtest for {steps} steps...")
     
     for i in range(steps):
         # 1. AI Control Strategy
         # Predict load for current sequence
         with torch.no_grad():
             current_X = X_test[i:i+1].to(torch.float32)
-            predicted_load = model(current_X).mean().item()
-            # De-normalize load (approximate for fitness)
-            real_predicted_load = predicted_load * 100 + 150 # Simplified de-normalization
+            predicted_load_scaled = model(current_X).mean().item()
+            
+            # De-normalize predicted load properly using scaler
+            dummy_p = np.zeros((1, num_features))
+            dummy_p[0, target_idx] = predicted_load_scaled
+            real_predicted_load = scaler.inverse_transform(dummy_p)[0, target_idx]
             
         def hvac_fitness(x):
-            # x[0] is setpoint temperature
             setpoint = x[0]
-            # Energy model: energy = load * (cooling_delta)
-            energy = real_predicted_load * (26 - setpoint) / 8.0 
+            # Non-linear energy model: load * (delta ^ 1.2) / 10 + base_cost
+            cooling_demand = max(0, 26 - setpoint)
+            energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
             comfort = abs(setpoint - 22.5) 
             return [energy, comfort]
             
         mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=20, max_iter=10)
         pareto = mopso.solve()
         
-        # Strategy: Choose the "elbow" solution from the Pareto front
-        # For simplicity, we choose a solution that has good comfort (e.g. 23-24C) but saves energy
-        # Utopia point in normalized space: [min(energy), min(comfort)]
+        # Strategy selection: Utopia point
         energies = [p['fitness'][0] for p in pareto]
         comforts = [p['fitness'][1] for p in pareto]
         min_e, max_e = min(energies), max(energies)
         min_c, max_c = min(comforts), max(comforts)
-        
-        # Avoid division by zero
         de = max_e - min_e if max_e > min_e else 1.0
         dc = max_c - min_c if max_c > min_c else 1.0
         
@@ -63,16 +94,13 @@ def run_backtest(model, X_test, y_test, scaler, steps=24):
         best_sol = min(pareto, key=utopia_dist)
         ai_setpoint = best_sol['position'][0]
         ai_setpoints.append(ai_setpoint)
+        ai_energy.append(best_sol['fitness'][0])
+        ai_comfort.append(best_sol['fitness'][1])
         
-        # Calculate AI actual performance
-        ai_e = best_sol['fitness'][0]
-        ai_c = best_sol['fitness'][1]
-        ai_energy.append(ai_e)
-        ai_comfort.append(ai_c)
-        
-        # 2. Baseline Control Strategy (Fixed 22.0C - Less efficient)
+        # 2. Baseline Control Strategy (Fixed 22.0C)
         base_setpoint = 22.0
-        base_e = real_predicted_load * (26 - base_setpoint) / 8.0
+        cooling_demand_base = max(0, 26 - base_setpoint)
+        base_e = real_predicted_load * (cooling_demand_base ** 1.2) / 10.0 + 5.0
         base_c = abs(base_setpoint - 22.5)
         baseline_energy.append(base_e)
         baseline_comfort.append(base_c)

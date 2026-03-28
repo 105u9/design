@@ -36,18 +36,32 @@ class GATLayer(nn.Module):
         self.leakyrelu = nn.LeakyReLU(0.2)
 
     def forward(self, h, adj):
-        Wh = torch.matmul(h, self.W) # [N, out_feat]
-        N = Wh.size()[0]
+        # h: [B, N, in_feat] or [N, in_feat]
+        is_batched = h.dim() == 3
+        if not is_batched:
+            h = h.unsqueeze(0)
+            
+        B, N, _ = h.size()
+        Wh = torch.matmul(h, self.W) # [B, N, out_feat]
         
-        a_input = torch.cat([Wh.repeat(1, N).view(N * N, -1), Wh.repeat(N, 1)], dim=1).view(N, -1, 2 * self.out_features)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(2))
+        # a_input: [B, N, N, 2*out_feat]
+        Wh_repeat = Wh.repeat_interleave(N, dim=1) # [B, N*N, out_feat]
+        Wh_tile = Wh.repeat(1, N, 1) # [B, N*N, out_feat]
+        a_input = torch.cat([Wh_repeat, Wh_tile], dim=2).view(B, N, N, 2 * self.out_features)
+        
+        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3)) # [B, N, N]
 
         zero_vec = -9e15 * torch.ones_like(e)
+        # adj should be [N, N] or [B, N, N]
+        if adj.dim() == 2:
+            adj = adj.unsqueeze(0).expand(B, -1, -1)
+            
         attention = torch.where(adj > 0, e, zero_vec)
-        attention = torch.softmax(attention, dim=1)
-        h_prime = torch.matmul(attention, Wh)
+        attention = torch.softmax(attention, dim=2)
+        h_prime = torch.matmul(attention, Wh) # [B, N, out_feat]
 
-        return torch.relu(h_prime)
+        out = torch.relu(h_prime)
+        return out if is_batched else out.squeeze(0)
 
 # Phase 3: Node2Vec Embedding (Simplified)
 class Node2VecEmbedding:
@@ -81,8 +95,14 @@ class Decoder(nn.Module):
         return prediction, hidden, cell
 
 class LSTM_ED_Model(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, forecast_len):
+    def __init__(self, input_size, hidden_size, output_size, forecast_len, num_nodes=None):
         super(LSTM_ED_Model, self).__init__()
+        self.num_nodes = num_nodes if num_nodes is not None else input_size
+        
+        # Integration of GAT to capture spatial/feature correlations
+        # We treat each feature as a "node" in the graph
+        self.gat = GATLayer(in_features=1, out_features=1, heads=1) 
+        
         self.encoder = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.decoder_cell = nn.LSTMCell(output_size, hidden_size)
         self.fc = nn.Linear(hidden_size, output_size)
@@ -90,19 +110,35 @@ class LSTM_ED_Model(nn.Module):
         self.hidden_size = hidden_size
         self.output_size = output_size
         
-    def forward(self, x):
+    def forward(self, x, adj=None):
         # x: [batch_size, seq_len, input_size]
-        batch_size = x.size(0)
-        _, (h, c) = self.encoder(x)
+        batch_size, seq_len, input_size = x.size()
+        
+        if adj is None:
+            # Default to fully connected graph between features
+            adj = torch.ones((input_size, input_size)).to(x.device)
+            
+        # Process each time step through GAT (spatial/feature interaction)
+        # x_gnn: [batch_size, seq_len, input_size]
+        x_gnn_list = []
+        for t in range(seq_len):
+            # Treat each feature as a node with 1-dim feature
+            h_t = x[:, t, :].unsqueeze(-1) # [batch_size, input_size, 1]
+            h_t_gat = self.gat(h_t, adj) # [batch_size, input_size, 1]
+            x_gnn_list.append(h_t_gat.squeeze(-1).unsqueeze(1))
+            
+        x_gnn = torch.cat(x_gnn_list, dim=1) # [batch_size, seq_len, input_size]
+        
+        _, (h, c) = self.encoder(x_gnn)
         h, c = h[0], c[0] # [batch_size, hidden_size]
         
-        # Initial decoder input (last target value, or zero for simplicity)
+        # Initial decoder input
         decoder_input = torch.zeros(batch_size, self.output_size).to(x.device)
         
         outputs = []
         for _ in range(self.forecast_len):
             h, c = self.decoder_cell(decoder_input, (h, c))
-            prediction = self.fc(h) # [batch_size, output_size]
+            prediction = self.fc(h) 
             outputs.append(prediction.unsqueeze(1))
             decoder_input = prediction # Auto-regressive
             

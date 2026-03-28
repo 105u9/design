@@ -11,6 +11,7 @@ from models import LSTM_ED_Model, GraphSageLayer
 from optimization import MOPSO
 from evaluation import run_backtest
 import uvicorn
+import joblib
 
 import torch
 import torch.nn as nn
@@ -91,22 +92,31 @@ def run_pipeline():
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss/(len(X_train)/batch_size):.6f}, Val Loss: {test_loss.item():.6f}")
             
         torch.save(model.state_dict(), "src/lstm_model.pth")
-        print("Model trained on full dataset and saved to src/lstm_model.pth.")
+        joblib.dump(scaler, "src/data_scaler.pkl")
+        print("Model and scaler saved to src/.")
 
         # 3. Optimization Strategy (Phase 4)
         print("\n[Step 3/3] Running MOPSO optimization (Energy vs Comfort)...")
         # Use the trained model to predict future load for a given setpoint
-        # For simplicity, we define a fitness that uses the model's prediction trend
         model.eval()
         with torch.no_grad():
+            # Get real recent data for prediction
             last_seq = X[-1:].to(torch.float32)
-            predicted_future_load = model(last_seq).mean().item()
+            predicted_load_scaled = model(last_seq).mean().item()
+            
+            # De-normalize predicted load properly using scaler
+            dummy_pred = np.zeros((1, X.shape[2]))
+            target_idx = df_normalized.select_dtypes(include=[np.number]).columns.get_loc('power_usage')
+            dummy_pred[0, target_idx] = predicted_load_scaled
+            real_predicted_load = scaler.inverse_transform(dummy_pred)[0, target_idx]
             
         def hvac_fitness(x):
             # x[0] is setpoint temperature
             setpoint = x[0]
-            # Energy cost depends on predicted load and setpoint
-            energy = predicted_future_load * (26 - setpoint) / 8.0 
+            # Energy model: Non-linear cooling demand with base cost
+            # energy = load * (cooling_delta ^ 1.2) / 10.0 + base_cost
+            cooling_demand = max(0, 26 - setpoint)
+            energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
             # Comfort (PMV-like) distance to 22.5C
             comfort = abs(setpoint - 22.5) 
             return [energy, comfort]
