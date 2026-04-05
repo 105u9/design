@@ -46,6 +46,17 @@ def calculate_pcc(df):
     corr_matrix = df[numeric_cols].corr(method='pearson')
     return corr_matrix
 
+def generate_pcc_adj(df, threshold=0.5):
+    """
+    Generate an adjacency matrix based on Pearson Correlation Coefficients.
+    Only connections with |PCC| > threshold are kept.
+    """
+    corr_matrix = calculate_pcc(df)
+    adj = (corr_matrix.abs() > threshold).astype(float).values
+    # Set diagonal to 1 (self-loops)
+    np.fill_diagonal(adj, 1.0)
+    return adj, corr_matrix.columns.tolist()
+
 def select_features(corr_matrix, threshold=0.5):
     # Requirement: Extract significant correlation (|PCC| > 0.5)
     features = []

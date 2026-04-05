@@ -1,7 +1,45 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 
-# Phase 4: Multi-Objective Particle Swarm Optimization (MOPSO)
+# Phase 4:# Phase 4: PMV (Predicted Mean Vote) Model for Comfort Calculation
+def calculate_pmv(ta, tr, rh, v, m, icl):
+    """
+    Standard PMV calculation based on ISO 7730.
+    ta: Air Temperature (C)
+    tr: Mean Radiant Temperature (C) - often same as Ta
+    rh: Relative Humidity (%)
+    v: Air Velocity (m/s)
+    m: Metabolic Rate (met)
+    icl: Clothing Insulation (clo)
+    """
+    pa = rh * 10 * np.exp(16.6536 - 4030.183 / (ta + 235)) # Water vapor pressure
+    
+    icl_m2k_w = 0.155 * icl
+    m_w_m2 = m * 58.15
+    fcl = 1.0 + 0.2 * icl if icl <= 0.5 else 1.05 + 0.1 * icl
+    
+    hcf = 12.1 * np.sqrt(v)
+    taa = ta + 273.15
+    tra = tr + 273.15
+    
+    # Surface temperature of clothing (Iterative, but we use simplified approximation)
+    tcl = ta + (35.5 - ta) / (3.5 * icl_m2k_w * 1 + 1) 
+    
+    # Heat loss components
+    hl1 = 3.05e-3 * (5733 - 6.99 * (m_w_m2 - 58.15) - pa)
+    hl2 = 0.42 * (m_w_m2 - 58.15 - 58.15) if m_w_m2 > 58.15 else 0
+    hl3 = 1.7e-5 * m_w_m2 * (5867 - pa)
+    hl4 = 0.0014 * m_w_m2 * (34 - ta)
+    hl5 = 3.96e-8 * fcl * (pow(tcl + 273.15, 4) - pow(tra, 4))
+    hl6 = fcl * hcf * (tcl - ta)
+    
+    ts = 0.303 * np.exp(-0.036 * m_w_m2) + 0.028
+    l = m_w_m2 - hl1 - hl2 - hl3 - hl4 - hl5 - hl6 # Thermal load
+    
+    pmv = ts * l
+    return pmv
+
+# Multi-Objective Particle Swarm Optimization (MOPSO)
 class Particle:
     def __init__(self, bounds):
         self.position = np.array([np.random.uniform(b[0], b[1]) for b in bounds])

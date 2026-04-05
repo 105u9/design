@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from optimization import MOPSO
+from optimization import MOPSO, calculate_pmv
 
 def calculate_metrics(y_true, y_pred):
     """Calculate RMSE and MAPE for model evaluation"""
@@ -18,7 +18,7 @@ def calculate_metrics(y_true, y_pred):
         mape = 0.0
     return rmse, mape
 
-def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24):
+def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24, adj=None):
     """
     Perform a data-driven backtest on the test set.
     Compares AI control (MOPSO) with Baseline control (Fixed Setpoint).
@@ -28,7 +28,7 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
     
     # 0. Initial model error evaluation
     with torch.no_grad():
-        preds_scaled = model(X_test[:steps].to(device)).cpu().numpy() # [steps, forecast_len, output_size]
+        preds_scaled = model(X_test[:steps].to(device), adj=adj).cpu().numpy() # [steps, forecast_len, output_size]
         y_true_scaled = y_test[:steps].cpu().numpy() # [steps, forecast_len, output_size]
         
         num_features = X_test.shape[2]
@@ -60,9 +60,11 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
     baseline_energy = []
     baseline_comfort = []
     
-    # Power usage target index for energy calculation
+    # Power usage and Humidity target index for optimization
     power_idx_in_y = target_cols.index('power_usage')
     power_target_idx = target_idxs[power_idx_in_y]
+    rh_idx_in_y = target_cols.index('indoor_humidity')
+    rh_target_idx = target_idxs[rh_idx_in_y]
 
     print(f"\nStarting CSV-based Backtest for {steps} steps...")
     
@@ -71,21 +73,30 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         # Predict load for current sequence
         with torch.no_grad():
             current_X = X_test[i:i+1].to(device)
-            # Take the first target (power_usage) mean for optimization
-            predicted_load_scaled = model(current_X)[0, :, power_idx_in_y].mean().item()
+            # Take the mean for the next horizon
+            all_preds_scaled = model(current_X, adj=adj)[0].mean(dim=0).cpu().numpy()
             
-            # De-normalize predicted load properly using scaler
+            # De-normalize predicted values
+            # Load
             dummy_p = np.zeros((1, num_features))
-            dummy_p[0, power_target_idx] = predicted_load_scaled
+            dummy_p[0, power_target_idx] = all_preds_scaled[power_idx_in_y]
             real_predicted_load = scaler.inverse_transform(dummy_p)[0, power_target_idx]
+            
+            # Humidity
+            dummy_rh = np.zeros((1, num_features))
+            dummy_rh[0, rh_target_idx] = all_preds_scaled[rh_idx_in_y]
+            real_predicted_rh = scaler.inverse_transform(dummy_rh)[0, rh_target_idx]
             
         def hvac_fitness(x):
             setpoint = x[0]
             # Non-linear energy model: load * (delta ^ 1.2) / 10 + base_cost
             cooling_demand = max(0, 26 - setpoint)
             energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
-            comfort = abs(setpoint - 22.5) 
-            return [energy, comfort]
+            
+            # PMV-based comfort
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+            comfort_penalty = abs(pmv)
+            return [energy, comfort_penalty]
             
         mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=20, max_iter=10)
         pareto = mopso.solve()
@@ -113,7 +124,10 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         base_setpoint = 24.0
         cooling_demand_base = max(0, 26 - base_setpoint)
         base_e = real_predicted_load * (cooling_demand_base ** 1.2) / 10.0 + 5.0
-        base_c = abs(base_setpoint - 22.5)
+        
+        pmv_base = calculate_pmv(ta=base_setpoint, tr=base_setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        base_c = abs(pmv_base)
+        
         baseline_energy.append(base_e)
         baseline_comfort.append(base_c)
 

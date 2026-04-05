@@ -37,6 +37,14 @@ tags_metadata = [
     },
 ]
 
+# Import our custom modules
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from models import LSTM_ED_Model
+from optimization import MOPSO, calculate_pmv
+from preprocessing import load_building_data, clean_and_impute, normalize_data
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,9 +70,13 @@ app = FastAPI(
 
 # Load global scaler and model
 scaler = None
+adj_matrix = None
 if os.path.exists("src/data_scaler.pkl"):
     scaler = joblib.load("src/data_scaler.pkl")
     logger.info("Loaded scaler from src/data_scaler.pkl")
+if os.path.exists("src/adj_matrix.pkl"):
+    adj_matrix = joblib.load("src/adj_matrix.pkl")
+    logger.info("Loaded adjacency matrix from src/adj_matrix.pkl")
 
 # Device Detection
 cuda_available = torch.cuda.is_available()
@@ -254,8 +266,11 @@ def predict_load(current_user: dict = Depends(get_current_user)):
                 recent_data_scaled = scaler.transform(recent_df)
                 input_tensor = torch.FloatTensor(recent_data_scaled).unsqueeze(0).to(device) # [1, 24, num_features]
                 
+                # Convert adj_matrix to tensor
+                adj_tensor = torch.FloatTensor(adj_matrix).to(device) if adj_matrix is not None else None
+                
                 with torch.no_grad():
-                    pred = model_instance(input_tensor) # Output shape: [1, 12, 4]
+                    pred = model_instance(input_tensor, adj=adj_tensor) # Output shape: [1, 12, 4]
                 
                 # Get raw predicted values for each dimension
                 predictions = {}
@@ -301,7 +316,7 @@ def predict_load(current_user: dict = Depends(get_current_user)):
 @app.post("/api/v1/optimize", response_model=ControlAction, tags=["优化控制"], summary="多目标决策优化", description="""
 基于当前的负荷预测结果，通过 **MOPSO (Multi-Objective Particle Swarm Optimization)** 算法动态计算最优设定值。
 *   **能耗目标**：降低空调能耗。
-*   **舒适度目标**：使室内温度尽可能接近人体最舒适温度（约 22.5℃）。
+*   **舒适度目标**：基于 **PMV (预期平均热感觉)** 模型，使室内热环境达到最适宜状态。
 系统会从帕累托最优解集中选择一个兼顾两者的平衡方案。
 """)
 def optimize_control(current_user: dict = Depends(get_current_user)):
@@ -315,16 +330,50 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
             mode="BASELINE_FIXED"
         )
 
+    # 1. Get recent predicted load and humidity for fitness calculation
+    real_predicted_load = 150.0 # Default
+    real_predicted_rh = 50.0 # Default
+    
+    if model_instance and scaler and len(real_samples) >= 24:
+        try:
+            recent_df = pd.DataFrame(real_samples[-24:]).select_dtypes(include=[np.number])
+            recent_data_scaled = scaler.transform(recent_df)
+            input_tensor = torch.FloatTensor(recent_data_scaled).unsqueeze(0).to(device)
+            adj_tensor = torch.FloatTensor(adj_matrix).to(device) if adj_matrix is not None else None
+            
+            with torch.no_grad():
+                preds_scaled = model_instance(input_tensor, adj=adj_tensor)[0].mean(dim=0).cpu().numpy()
+                
+                # De-normalize load and humidity
+                # Power
+                d_p = np.zeros((1, recent_df.shape[1]))
+                p_idx = recent_df.columns.get_loc('power_usage')
+                d_p[0, p_idx] = preds_scaled[0] # power_usage is at index 0
+                real_predicted_load = scaler.inverse_transform(d_p)[0, p_idx]
+                
+                # Humidity
+                d_rh = np.zeros((1, recent_df.shape[1]))
+                rh_idx = recent_df.columns.get_loc('indoor_humidity')
+                d_rh[0, rh_idx] = preds_scaled[2] # indoor_humidity is at index 2
+                real_predicted_rh = scaler.inverse_transform(d_rh)[0, rh_idx]
+        except Exception as e:
+            logger.warning(f"Optimization prediction failed, using defaults: {e}")
+
     def fitness_func(x):
-        # x[0] = setpoint temp
-        energy = x[0]**2 - 40 * x[0] + 500 # Simplified quadratic energy model
-        comfort = abs(x[0] - 22.5) # Distance to ideal comfort temp
-        return [energy, comfort]
+        setpoint = x[0]
+        # Energy model: Non-linear cooling demand
+        cooling_demand = max(0, 26 - setpoint)
+        energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
+        
+        # Comfort model: PMV
+        pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        comfort_penalty = abs(pmv)
+        return [energy, comfort_penalty]
 
     mopso = MOPSO(fitness_func, bounds=[[18, 26]], num_particles=20, max_iter=10)
     pareto_front = mopso.solve()
     
-    # Select the best compromise solution (e.g., closest to ideal temp)
+    # Strategy selection: Utopia point (Closest to PMV=0 and Min Energy)
     best_sol = min(pareto_front, key=lambda x: x['fitness'][1])
     
     return ControlAction(

@@ -6,9 +6,9 @@ import sys
 # Ensure src is in the path
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from preprocessing import load_data, clean_and_impute, normalize_data, calculate_pcc, load_building_data
+from preprocessing import load_data, clean_and_impute, normalize_data, calculate_pcc, load_building_data, generate_pcc_adj
 from models import LSTM_ED_Model, GraphSageLayer
-from optimization import MOPSO
+from optimization import MOPSO, calculate_pmv
 from evaluation import run_backtest
 import uvicorn
 import joblib
@@ -52,13 +52,20 @@ def run_pipeline():
     try:
         df_raw = load_building_data(building_id, site_id)
         df_cleaned = clean_and_impute(df_raw, method='mean')
+        
+        # --- NEW: Generate real adjacency matrix from PCC ---
+        print("Generating Graph topology from Pearson Correlation Coefficients...")
+        adj_matrix, feature_names = generate_pcc_adj(df_cleaned, threshold=0.5)
+        adj_tensor = torch.FloatTensor(adj_matrix).to(device)
+        joblib.dump(adj_matrix, "src/adj_matrix.pkl")
+        
         df_normalized, scaler = normalize_data(df_cleaned)
         print(f"Data loading complete for building: {building_id}")
         
         # 2. Algorithm & Model (Phase 3)
         # Requirement: Predict multi-dimensional environmental parameters
         target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
-        print(f"\n[Step 2/4] Training LSTM Prediction Model (Encoder-Decoder) for: {target_cols}")
+        print(f"\n[Step 2/4] Training LSTM Prediction Model (Encoder-Decoder) with GAT for: {target_cols}")
         X, y = prepare_sequences(df_normalized, target_cols=target_cols)
         
         # Split into train/test (80/20)
@@ -88,7 +95,7 @@ def run_pipeline():
                 batch_y = y_train[i:i+batch_size].to(device)
                 
                 optimizer.zero_grad()
-                out = model(batch_X)
+                out = model(batch_X, adj=adj_tensor) # PASS REAL ADJ MATRIX
                 loss = criterion(out, batch_y)
                 loss.backward()
                 optimizer.step()
@@ -97,51 +104,66 @@ def run_pipeline():
             # Validation
             model.eval()
             with torch.no_grad():
-                test_out = model(X_test[:100].to(device)) # Sample test
+                test_out = model(X_test[:100].to(device), adj=adj_tensor) # PASS REAL ADJ MATRIX
                 test_loss = criterion(test_out, y_test[:100].to(device))
                 
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss/(len(X_train)/batch_size):.6f}, Val Loss: {test_loss.item():.6f}")
             
         torch.save(model.state_dict(), "src/lstm_model.pth")
         joblib.dump(scaler, "src/data_scaler.pkl")
-        print("Model and scaler saved to src/.")
+        print("Model, scaler and adj_matrix saved to src/.")
 
         # 3. Optimization Strategy (Phase 4)
-        print("\n[Step 3/4] Running MOPSO optimization (Energy vs Comfort)...")
+        print("\n[Step 3/4] Running MOPSO optimization (Energy vs Comfort/PMV)...")
         # Use the trained model to predict future load for a given setpoint
         model.eval()
         with torch.no_grad():
             # Get real recent data for prediction
             last_seq = X[-1:].to(device)
-            # Predict for the power_usage channel (index 0 in output)
-            predicted_load_scaled = model(last_seq)[0, :, 0].mean().item()
+            # Predict for all channels
+            preds_scaled = model(last_seq, adj=adj_tensor)[0] # [12, 4]
             
-            # De-normalize predicted load properly using scaler
+            # Mean predicted values for the next 12 hours
+            avg_preds_scaled = preds_scaled.mean(dim=0).cpu().numpy() # [4]
+            
+            # De-normalize predicted values properly using scaler
             dummy_pred = np.zeros((1, X.shape[2]))
             target_idxs = [df_normalized.select_dtypes(include=[np.number]).columns.get_loc(col) for col in target_cols]
-            power_target_idx = target_idxs[0] # power_usage
-            dummy_pred[0, power_target_idx] = predicted_load_scaled
-            real_predicted_load = scaler.inverse_transform(dummy_pred)[0, power_target_idx]
+            
+            # De-normalize each target
+            real_preds = {}
+            for i, col in enumerate(target_cols):
+                d_p = np.zeros((1, X.shape[2]))
+                d_p[0, target_idxs[i]] = avg_preds_scaled[i]
+                real_preds[col] = scaler.inverse_transform(d_p)[0, target_idxs[i]]
+            
+            real_predicted_load = real_preds['power_usage']
+            real_predicted_rh = real_preds['indoor_humidity']
             
         def hvac_fitness(x):
             # x[0] is setpoint temperature
             setpoint = x[0]
-            # Energy model: Non-linear cooling demand with base cost
-            # energy = load * (cooling_delta ^ 1.2) / 10.0 + base_cost
+            # 1. Energy model: Non-linear cooling demand
             cooling_demand = max(0, 26 - setpoint)
             energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
-            # Comfort (PMV-like) distance to 22.5C
-            comfort = abs(setpoint - 22.5) 
-            return [energy, comfort]
+            
+            # 2. Comfort model: PMV (Predicted Mean Vote)
+            # Standard parameters: v=0.1m/s, m=1.0met, icl=0.5clo
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+            comfort_penalty = abs(pmv) # Target is PMV = 0
+            
+            return [energy, comfort_penalty]
         
         mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20) 
         pareto = mopso.solve()
         print(f"MOPSO solved. Found {len(pareto)} Pareto-optimal control points.")
-        print(f"Sample recommendation (Best comfort): {min(pareto, key=lambda p: p['fitness'][1])['position'][0]:.2f}C")
+        best_comfort_sol = min(pareto, key=lambda p: p['fitness'][1])
+        print(f"Sample recommendation (Best PMV={best_comfort_sol['fitness'][1]:.2f}): {best_comfort_sol['position'][0]:.2f}C")
 
         # 4. CSV Backtest Simulation (Evaluation)
         print("\n[Step 4/4] Starting CSV-based Backtest Simulation (AI vs Baseline)...")
-        saving_rate = run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24)
+        # Pass adj_tensor for evaluation
+        saving_rate = run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24, adj=adj_tensor)
         print(f"\nFinal Saving Rate: {saving_rate:.2f}%")
         print("Backtest simulation complete. Results saved to 'src/evaluation_report.png'.")
 
