@@ -134,6 +134,8 @@ def run_pipeline():
         teacher_forcing_ratio = 0.5 # Initial ratio
         
         # Prepare DataLoader for efficiency
+        from torch.utils.data import TensorDataset, DataLoader
+        
         train_dataset = TensorDataset(X_train, y_train)
         # FIX: pin_memory=True only works with CPU tensors. 
         # Since we already moved X_train to GPU if available, pin_memory must be False.

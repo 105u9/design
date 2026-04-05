@@ -15,6 +15,7 @@ import logging
 import traceback
 from datetime import datetime, timedelta
 import jwt
+import sqlite3
 from passlib.context import CryptContext
 from cachetools import TTLCache, cached, keys
 
@@ -23,8 +24,63 @@ SECRET_KEY = "your-secret-key-for-graduation-project" # Change this in productio
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 120 # 2 hours as suggested
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# --- DATABASE Configuration (Persistence Optimization) ---
+DB_PATH = "src/hvac_system.db"
+
+def init_db():
+    """Initialize SQLite database for persistence"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # User Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL,
+            role TEXT DEFAULT 'operator'
+        )
+    ''')
+    
+    # Sensor Data Table (Time-series)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sensor_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            temperature REAL,
+            humidity REAL,
+            co2 REAL,
+            power REAL
+        )
+    ''')
+    
+    # Control Log Table (Closed-loop)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS control_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            setpoint REAL,
+            chilled_water REAL,
+            mode TEXT,
+            status TEXT DEFAULT 'SENT'
+        )
+    ''')
+    
+    # Insert default admin if not exists
+    cursor.execute("SELECT * FROM users WHERE username='admin'")
+    if not cursor.fetchone():
+        hashed_pwd = pwd_context.hash("admin123")
+        cursor.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, ?)", 
+                       ("admin", hashed_pwd, "admin"))
+    
+    conn.commit()
+    conn.close()
+
+# Initialize DB on startup
+init_db()
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
@@ -246,7 +302,13 @@ initialize_demo_data()
 # Endpoints
 @app.post("/token", tags=["认证管理"], summary="获取访问令牌", description="使用管理员账号获取 OAuth2 访问令牌，默认账号：admin，默认密码：admin123")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    if form_data.username == "admin" and form_data.password == "admin123":
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT hashed_password FROM users WHERE username=?", (form_data.username,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and pwd_context.verify(form_data.password, result[0]):
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={"sub": form_data.username}, expires_delta=access_token_expires
@@ -266,12 +328,15 @@ def read_root():
 """)
 def get_monitoring(current_user: dict = Depends(get_current_user)):
     """Get the latest 24 hours of monitoring data and system state"""
-    # Dynamic Simulation: If the frontend requests data, we can simulate a real-time increment
-    # This ensures the dashboard feels "live" even without external IoT input
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Simulate a real-time increment in DB to keep it "live"
     if history_data:
         last_data = history_data[-1]
-        # Simulate a small random walk from the last data point
-        new_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_time_dt = datetime.now()
+        new_time = new_time_dt.strftime("%Y-%m-%d %H:%M:%S")
+        
         if new_time != last_data.timestamp:
             new_val = SensorData(
                 timestamp=new_time,
@@ -283,9 +348,30 @@ def get_monitoring(current_user: dict = Depends(get_current_user)):
             history_data.append(new_val)
             if len(history_data) > MAX_HISTORY:
                 history_data.pop(0)
+            
+            # Persist new data to DB
+            cursor.execute('''
+                INSERT INTO sensor_history (timestamp, temperature, humidity, co2, power)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (new_val.timestamp, new_val.temperature, new_val.humidity, new_val.co2, new_val.power))
+            conn.commit()
+
+    # Get data from SQLite for actual response
+    cursor.execute('''
+        SELECT timestamp, temperature, humidity, co2, power 
+        FROM sensor_history 
+        ORDER BY timestamp DESC LIMIT 24
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    db_history = [
+        SensorData(timestamp=r[0], temperature=r[1], humidity=r[2], co2=r[3], power=r[4])
+        for r in reversed(rows)
+    ]
 
     return {
-        "history": history_data[-24:],
+        "history": db_history if db_history else history_data[-24:],
         "system": system_state
     }
 
@@ -300,10 +386,22 @@ def toggle_ai(mode: bool, current_user: dict = Depends(get_current_user)):
 @app.post("/api/v1/collect", tags=["环境感知"], summary="接收传感器数据", description="模拟工业物联网 (IoT) 设备的实时采集数据上报接口。")
 def collect_data(data: SensorData, current_user: dict = Depends(get_current_user)):
     """Receive real-time data from sensors (Perception -> Platform)"""
+    # Memory update
     history_data.append(data)
     if len(history_data) > MAX_HISTORY:
         history_data.pop(0)
-    logger.info(f"接收到传感器数据: {data}")
+    
+    # Database persistence
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO sensor_history (timestamp, temperature, humidity, co2, power)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (data.timestamp, data.temperature, data.humidity, data.co2, data.power))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"接收到传感器数据并持久化: {data}")
     return {"status": "success", "received_at": datetime.now().isoformat()}
 
 @app.post("/api/v1/predict", response_model=PredictionResponse, tags=["智能预测"], summary="多维负荷预测", description="""
@@ -547,9 +645,28 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
         # Fallback to the one with minimum comfort deviation if still none
         best_sol = min(pareto_front, key=lambda p: p['fitness'][1])
     
+    # --- CLOSED-LOOP CONTROL DOWNLINK (Simulation) ---
+    # In a real scenario, this would send Modbus/MQTT commands to the hardware PLC/DDC
+    setpoint_val = float(best_sol['position'][0])
+    chilled_water_val = 7.0 + np.random.uniform(-0.5, 0.5)
+    
+    # Persist the control action to the database logs
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO control_logs (timestamp, setpoint, chilled_water, mode)
+            VALUES (?, ?, ?, ?)
+        ''', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), setpoint_val, chilled_water_val, "AI_OPTIMIZED"))
+        conn.commit()
+        conn.close()
+        logger.info(f"AI 控制指令已下发并记录: Setpoint={setpoint_val:.2f}C, ChilledWater={chilled_water_val:.2f}C")
+    except Exception as e:
+        logger.error(f"Failed to log control action: {e}")
+
     return ControlAction(
-        chilled_water_temp=7.0 + np.random.uniform(-0.5, 0.5),
-        supply_air_setpoint=float(best_sol['position'][0]),
+        chilled_water_temp=chilled_water_val,
+        supply_air_setpoint=setpoint_val,
         mode="AI_OPTIMIZED"
     )
 

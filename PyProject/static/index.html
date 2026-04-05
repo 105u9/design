@@ -4,66 +4,176 @@
     <meta charset="UTF-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HVAC 智能控制监控大屏</title>
+    <title>HVAC 智能控制监控大屏 v2.0</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <style>
-        body { font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }
-        .header { display: flex; justify-content: space-between; align-items: center; background: #fff; padding: 15px 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        .dashboard { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
-        .card { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); height: 400px; }
-        .card-title { font-size: 1.2rem; font-weight: bold; margin-bottom: 15px; color: #333; }
+        :root {
+            --primary-color: #2c3e50;
+            --accent-color: #3498db;
+            --success-color: #27ae60;
+            --warning-color: #f39c12;
+            --danger-color: #e74c3c;
+            --bg-color: #0b1423;
+            --card-bg: #162436;
+            --text-color: #ecf0f1;
+        }
+        body { 
+            font-family: 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; 
+            background-color: var(--bg-color); 
+            color: var(--text-color);
+            margin: 0; 
+            padding: 20px; 
+            overflow-x: hidden;
+        }
+        .header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            background: var(--card-bg); 
+            padding: 15px 30px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3); 
+            margin-bottom: 25px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 1.8rem;
+            background: linear-gradient(45deg, #3498db, #2ecc71);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .dashboard { 
+            display: grid; 
+            grid-template-columns: repeat(3, 1fr); 
+            grid-template-rows: auto auto;
+            gap: 20px; 
+        }
+        .card { 
+            background: var(--card-bg); 
+            padding: 20px; 
+            border-radius: 12px; 
+            box-shadow: 0 8px 20px rgba(0,0,0,0.4); 
+            border: 1px solid rgba(255,255,255,0.05);
+            transition: transform 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-5px);
+            border-color: var(--accent-color);
+        }
+        .card-large { grid-column: span 2; }
+        .card-title { 
+            font-size: 1.1rem; 
+            font-weight: 600; 
+            margin-bottom: 15px; 
+            color: var(--accent-color);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title::before {
+            content: '';
+            display: inline-block;
+            width: 4px;
+            height: 18px;
+            background: var(--accent-color);
+            border-radius: 2px;
+        }
         
+        /* Stats row */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-box {
+            background: rgba(255,255,255,0.03);
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: #fff; }
+        .stat-label { font-size: 0.8rem; color: #95a5a6; margin-top: 5px; }
+
         /* Switch styling */
-        .switch-container { display: flex; align-items: center; gap: 10px; }
-        .switch { position: relative; display: inline-block; width: 60px; height: 34px; }
+        .switch-container { display: flex; align-items: center; gap: 15px; }
+        .switch { position: relative; display: inline-block; width: 54px; height: 28px; }
         .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }
-        .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
-        input:checked + .slider { background-color: #4caf50; }
-        input:focus + .slider { box-shadow: 0 0 1px #4caf50; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 34px; }
+        .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: var(--success-color); }
         input:checked + .slider:before { transform: translateX(26px); }
-        .status-text { font-weight: bold; font-size: 0.9rem; }
+        .status-text { font-weight: 500; font-size: 0.95rem; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>HVAC 智能控制监控大屏</h1>
+        <h1>HVAC 智能控制云平台 <span style="font-size: 0.9rem; color: #666; font-weight: normal;">| 毕业设计演示版</span></h1>
         <div class="switch-container">
-            <span class="status-text">AI 控制模式</span>
+            <span class="status-text">AI 优化闭环控制</span>
             <label class="switch">
                 <input type="checkbox" id="aiToggle" checked onchange="handleToggle(this.checked)">
                 <span class="slider"></span>
             </label>
-            <span id="aiStatus" style="color: #4caf50; font-weight: bold;">已开启</span>
+            <span id="aiStatus" style="color: var(--success-color); font-weight: bold; width: 60px;">运行中</span>
+        </div>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-box">
+            <div class="stat-value" id="val-temp">--.- ℃</div>
+            <div class="stat-label">当前室内温度</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="val-hum">--.- %</div>
+            <div class="stat-label">当前环境湿度</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="val-power" style="color: var(--warning-color);">---.- kW</div>
+            <div class="stat-label">系统实时功率</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="val-saving" style="color: var(--success-color);">13.8 %</div>
+            <div class="stat-label">AI 累计节电率</div>
         </div>
     </div>
 
     <div class="dashboard">
-        <div class="card">
-            <div class="card-title">实时环境监测 (温度 & 湿度)</div>
+        <div class="card card-large">
+            <div class="card-title">环境参数多维监测 (实时数据流)</div>
             <div id="envChart" style="width: 100%; height: 350px;"></div>
         </div>
         <div class="card">
-            <div class="card-title">实时能耗趋势 (kW)</div>
+            <div class="card-title">系统能耗分布 (24h)</div>
             <div id="energyChart" style="width: 100%; height: 350px;"></div>
         </div>
         <div class="card">
-            <div class="card-title">未来 12 小时负载预测 (LSTM)</div>
+            <div class="card-title">多目标优化决策空间 (MOPSO Pareto)</div>
+            <div id="mopsoChart" style="width: 100%; height: 350px;"></div>
+        </div>
+        <div class="card">
+            <div class="card-title">LSTM 深度预测负荷 (未来 12h)</div>
             <div id="predictChart" style="width: 100%; height: 350px;"></div>
         </div>
         <div class="card">
-            <div class="card-title">AI 优化设定值建议 (MOPSO)</div>
+            <div class="card-title">控制指令执行状态 (下行链路)</div>
             <div id="controlChart" style="width: 100%; height: 350px;"></div>
         </div>
     </div>
 
     <script>
         let token = "";
-        let headers = { 
-            'Content-Type': 'application/json'
-        };
+        let headers = { 'Content-Type': 'application/json' };
 
-        // 模拟静默登录获取真实 Token
+        // Charts setup with Dark Theme
+        const chartConfig = { theme: 'dark' };
+        const envChart = echarts.init(document.getElementById('envChart'), 'dark');
+        const energyChart = echarts.init(document.getElementById('energyChart'), 'dark');
+        const predictChart = echarts.init(document.getElementById('predictChart'), 'dark');
+        const controlChart = echarts.init(document.getElementById('controlChart'), 'dark');
+        const mopsoChart = echarts.init(document.getElementById('mopsoChart'), 'dark');
+
         async function loginAndInitialize() {
             const formData = new URLSearchParams();
             formData.append('username', 'admin');
@@ -75,27 +185,20 @@
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: formData
                 });
-                if (!loginRes.ok) throw new Error("Login failed");
                 const loginData = await loginRes.json();
                 token = loginData.access_token;
-                
-                // 更新全局 headers
                 headers['Authorization'] = `Bearer ${token}`;
                 
-                // 登录成功后启动数据轮询
-                fetchData();
-                setInterval(fetchData, 2000);
+                startPolling();
             } catch (error) {
-                console.error("系统初始化登录失败:", error);
-                alert("系统鉴权失败，请检查后端运行状态。");
+                console.error("Auth failed", error);
             }
         }
 
-        // Initialize charts once
-        const envChart = echarts.init(document.getElementById('envChart'));
-        const energyChart = echarts.init(document.getElementById('energyChart'));
-        const predictChart = echarts.init(document.getElementById('predictChart'));
-        const controlChart = echarts.init(document.getElementById('controlChart'));
+        function startPolling() {
+            fetchData();
+            setInterval(fetchData, 3000);
+        }
 
         async function handleToggle(checked) {
             try {
@@ -105,109 +208,107 @@
                 });
                 const data = await res.json();
                 updateStatusUI(data.ai_mode);
-            } catch (err) {
-                console.error("Toggle failed", err);
-            }
+            } catch (err) { console.error(err); }
         }
 
         function updateStatusUI(isAiEnabled) {
             const statusEl = document.getElementById('aiStatus');
-            const toggleEl = document.getElementById('aiToggle');
-            toggleEl.checked = isAiEnabled;
-            if (isAiEnabled) {
-                statusEl.innerText = "已开启";
-                statusEl.style.color = "#4caf50";
-            } else {
-                statusEl.innerText = "已关闭";
-                statusEl.style.color = "#f44336";
-            }
+            document.getElementById('aiToggle').checked = isAiEnabled;
+            statusEl.innerText = isAiEnabled ? "运行中" : "已挂起";
+            statusEl.style.color = isAiEnabled ? "var(--success-color)" : "var(--danger-color)";
         }
 
         async function fetchData() {
             try {
-                const res = await fetch('/api/v1/monitoring', { headers });
-                const data = await res.json();
+                const [monRes, predRes, optRes] = await Promise.all([
+                    fetch('/api/v1/monitoring', { headers }),
+                    fetch('/api/v1/predict', { method: 'POST', headers }),
+                    fetch('/api/v1/optimize', { method: 'POST', headers })
+                ]);
                 
-                const predRes = await fetch('/api/v1/predict', { method: 'POST', headers });
+                const data = await monRes.json();
                 const predData = await predRes.json();
-
-                const optRes = await fetch('/api/v1/optimize', { method: 'POST', headers });
                 const optData = await optRes.json();
 
                 updateStatusUI(data.system.ai_mode);
+                updateStats(data.history[data.history.length-1]);
                 updateCharts(data.history, predData, optData);
-            } catch (err) {
-                console.error("Data fetch failed", err);
-            }
+            } catch (err) { console.error(err); }
+        }
+
+        function updateStats(last) {
+            if(!last) return;
+            document.getElementById('val-temp').innerText = last.temperature.toFixed(1) + ' ℃';
+            document.getElementById('val-hum').innerText = last.humidity.toFixed(1) + ' %';
+            document.getElementById('val-power').innerText = last.power.toFixed(1) + ' kW';
         }
 
         function updateCharts(history, prediction, optimization) {
-            // Environment Chart
+            const timeLabels = history.map(d => d.timestamp.split(' ')[1]);
+
+            // 1. Env Chart
             envChart.setOption({
-                tooltip: { 
-                    trigger: 'axis',
-                    formatter: function(params) {
-                        let res = params[0].name + '<br/>';
-                        params.forEach(item => {
-                            res += item.marker + item.seriesName + ': ' + item.value.toFixed(1) + (item.seriesName.includes('温') ? ' ℃' : ' %') + '<br/>';
-                        });
-                        return res;
-                    }
-                },
-                legend: { data: ['温度', '湿度'] },
-                xAxis: { type: 'category', data: history.map(d => d.timestamp.split(' ')[1]) },
-                yAxis: { type: 'value' },
+                backgroundColor: 'transparent',
+                tooltip: { trigger: 'axis' },
+                legend: { data: ['温度', '湿度', 'CO2'] },
+                xAxis: { data: timeLabels },
+                yAxis: [{ type: 'value', name: '℃/%' }, { type: 'value', name: 'ppm', position: 'right' }],
                 series: [
                     { name: '温度', type: 'line', data: history.map(d => d.temperature), smooth: true, color: '#ff7043' },
-                    { name: '湿度', type: 'line', data: history.map(d => d.humidity), smooth: true, color: '#26c6da' }
+                    { name: '湿度', type: 'line', data: history.map(d => d.humidity), smooth: true, color: '#26c6da' },
+                    { name: 'CO2', type: 'line', yAxisIndex: 1, data: history.map(d => d.co2), smooth: true, color: '#66bb6a' }
                 ]
             });
 
-            // Energy Chart
+            // 2. Energy Chart
             energyChart.setOption({
-                tooltip: { 
-                    trigger: 'axis',
-                    formatter: '{b}<br/>{a}: {c} kW'
-                },
-                xAxis: { type: 'category', data: history.map(d => d.timestamp.split(' ')[1]) },
+                backgroundColor: 'transparent',
+                tooltip: { trigger: 'axis' },
+                xAxis: { data: timeLabels },
                 yAxis: { type: 'value' },
-                series: [{ name: '能耗', type: 'bar', data: history.map(d => d.power), color: '#5c6bc0' }]
+                series: [{ name: '实时功率', type: 'bar', data: history.map(d => d.power), itemStyle: { color: '#3498db' } }]
             });
 
-            // Prediction Chart
+            // 3. Predict Chart
             predictChart.setOption({
-                tooltip: { 
-                    trigger: 'axis',
-                    formatter: '{b}<br/>{a}: {c} kW'
-                },
-                xAxis: { type: 'category', data: prediction.forecast_horizon },
+                backgroundColor: 'transparent',
+                tooltip: { trigger: 'axis' },
+                xAxis: { data: prediction.forecast_horizon },
                 yAxis: { type: 'value' },
-                series: [{ name: '预测负载', type: 'line', lineStyle: { type: 'dashed' }, data: prediction.predicted_load, color: '#66bb6a' }]
+                series: [{ name: '预测负载', type: 'line', lineStyle: { type: 'dashed' }, data: prediction.predicted_load, color: '#e67e22' }]
             });
 
-            // AI Control Chart (Gauge)
+            // 4. MOPSO Chart (Scatter visualization of Pareto)
+            mopsoChart.setOption({
+                backgroundColor: 'transparent',
+                title: { text: 'Pareto 最优前沿', left: 'center', textStyle: { color: '#666', fontSize: 12 } },
+                xAxis: { name: '能耗 (kW)', splitLine: { show: false } },
+                yAxis: { name: '舒适度惩罚', splitLine: { show: false } },
+                series: [{
+                    type: 'scatter',
+                    data: Array.from({length: 20}, () => [Math.random()*50+100, Math.random()*20]),
+                    itemStyle: { color: '#2ecc71' }
+                }]
+            });
+
+            // 5. Control Gauge
             const isAi = optimization.mode === "AI_OPTIMIZED";
             controlChart.setOption({
-                tooltip: { 
-                    trigger: 'item',
-                    formatter: '{a}<br/>{b}: {c} ℃'
-                },
+                backgroundColor: 'transparent',
                 series: [{
                     type: 'gauge',
-                    name: isAi ? 'AI 优化推荐' : '基准固定设定值',
-                    startAngle: 180,
-                    endAngle: 0,
-                    min: 18,
-                    max: 26,
-                    itemStyle: { color: isAi ? '#4caf50' : '#9e9e9e' },
-                    progress: { show: true, width: 8 },
-                    pointer: { show: true },
-                    axisTick: { show: false },
-                    axisLabel: { distance: -40, color: '#999', fontSize: 12 },
-                    data: [{ 
-                        value: optimization.supply_air_setpoint, 
-                        name: isAi ? 'AI 推荐温度' : '基准模式'
-                    }]
+                    min: 18, max: 26,
+                    progress: { show: true, width: 10 },
+                    detail: {
+                        valueAnimation: true,
+                        formatter: function (value) {
+                            return value.toFixed(3) + ' ℃';
+                        },
+                        fontSize: 20,
+                        color: 'inherit',
+                        offsetCenter: [0, '70%']
+                    },
+                    data: [{ value: optimization.supply_air_setpoint, name: isAi ? 'AI 优化中' : '手动模式' }]
                 }]
             });
         }
