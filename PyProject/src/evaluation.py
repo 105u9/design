@@ -107,10 +107,13 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
             base_power = 20.0 # Increased base power to reduce extreme saving %
             energy = real_predicted_load * (1.0 + 0.15 * cooling_demand) + base_power
             
-            # --- IMPROVED COMFORT MODEL (Squared Penalty) ---
-            pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
-            # Penalty increases sharply outside the [-0.5, 0.5] range
-            comfort_penalty = (pmv ** 2) * 100.0 
+            # --- PHASE 5 UPGRADE: Realistic Office Comfort Model ---
+            # Parameters: icl=0.7 (Summer business casual), m=1.1 (Typical office activity)
+            # tr = ta + 1.0 (Radiation heat from equipment/windows)
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            
+            # Penalty logic: use squared error but with a small scaling factor to avoid numerical explosion
+            comfort_penalty = (pmv ** 2) * 50.0 
             return [energy, comfort_penalty]
             
         mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20)
@@ -121,7 +124,8 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         acceptable_sols = []
         for p in pareto:
             sp = p['position'][0]
-            pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+            # Must use the SAME parameters as in fitness function for consistency
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.5:
                 acceptable_sols.append(p)
         
@@ -129,7 +133,7 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         if not acceptable_sols:
             for p in pareto:
                 sp = p['position'][0]
-                pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
                 if abs(pmv_val) <= 0.8:
                     acceptable_sols.append(p)
                     
@@ -143,8 +147,8 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         ai_setpoints.append(ai_setpoint)
         ai_energy.append(best_sol['fitness'][0])
         
-        # Record ABSOLUTE PMV for evaluation, not the penalty
-        final_pmv = calculate_pmv(ta=ai_setpoint, tr=ai_setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        # Record ABSOLUTE PMV for evaluation
+        final_pmv = calculate_pmv(ta=ai_setpoint, tr=ai_setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
         ai_comfort.append(abs(final_pmv))
         
         # 2. Baseline Control Strategy (Fixed 24.0C)
@@ -153,7 +157,7 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         # Use EXACT SAME energy model for baseline to be fair
         base_e = real_predicted_load * (1.0 + 0.15 * cooling_demand_base) + 20.0
         
-        pmv_base = calculate_pmv(ta=base_setpoint, tr=base_setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        pmv_base = calculate_pmv(ta=base_setpoint, tr=base_setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
         base_c = abs(pmv_base)
         
         baseline_energy.append(base_e)

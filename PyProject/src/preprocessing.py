@@ -78,32 +78,59 @@ def select_features(corr_matrix, threshold=0.5):
 def load_building_data(building_id, site_id, meter_type='chilledwater'):
     base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
-    # Load Weather Data
+    # Load Weather Data (All Features)
     weather_path = os.path.join(base_path, "building-data-genome-project-2", "data", "weather", "weather.csv")
     df_weather = pd.read_csv(weather_path)
     df_weather['timestamp'] = pd.to_datetime(df_weather['timestamp'])
     df_weather = df_weather[df_weather['site_id'] == site_id]
     
-    # Load Meter Data
+    # Load Primary Meter Data (e.g., Chilled Water for Cooling Load)
     meter_path = os.path.join(base_path, "building-data-genome-project-2", "data", "meters", "cleaned", f"{meter_type}_cleaned.csv")
     df_meter = pd.read_csv(meter_path)
     df_meter['timestamp'] = pd.to_datetime(df_meter['timestamp'])
     
-    # Merge on timestamp
+    # Load Secondary Meter Data (e.g., Electricity for Internal Heat Gain proxy)
+    # This addresses "using all appropriate data types"
+    elec_path = os.path.join(base_path, "building-data-genome-project-2", "data", "meters", "cleaned", "electricity_cleaned.csv")
+    df_elec = pd.read_csv(elec_path)
+    df_elec['timestamp'] = pd.to_datetime(df_elec['timestamp'])
+    
+    # Merge all datasets
     df_merged = pd.merge(df_weather, df_meter[['timestamp', building_id]], on='timestamp')
     df_merged = df_merged.rename(columns={building_id: 'power_usage'})
+    
+    if building_id in df_elec.columns:
+        df_merged = pd.merge(df_merged, df_elec[['timestamp', building_id]], on='timestamp')
+        df_merged = df_merged.rename(columns={building_id: 'total_electricity'})
 
-    # --- NEW: Simulate Indoor Environment Variables for Graduation Requirement ---
-    # In a real IoT scenario, these would come from MQTT or TRNSYS.
-    # Here we derive them with some noise for training/testing.
+    # --- Feature Engineering: Enhanced Physical Indicators ---
+    # 1. Thermal Lag: 3-hour and 6-hour rolling average of outdoor temperature
+    # Buildings have thermal mass and do not respond instantly to outdoor changes.
+    df_merged['air_temp_rolling_3h'] = df_merged['airTemperature'].rolling(window=3, min_periods=1).mean()
+    df_merged['air_temp_rolling_6h'] = df_merged['airTemperature'].rolling(window=6, min_periods=1).mean()
+    
+    # 2. Solar Impact Proxy: Cloud coverage combined with hour of day
+    if 'cloudCoverage' in df_merged.columns:
+        # Simple proxy: during day (8-18), high cloud coverage reduces solar gain
+        is_day = (df_merged['timestamp'].dt.hour >= 8) & (df_merged['timestamp'].dt.hour <= 18)
+        df_merged['solar_proxy'] = np.where(is_day, 10.0 - df_merged['cloudCoverage'].fillna(5.0), 0.0)
+
+    # 3. Cyclical Wind Direction
+    if 'windDirection' in df_merged.columns:
+        df_merged['wind_dir_sin'] = np.sin(2 * np.pi * df_merged['windDirection'] / 360.0)
+        df_merged['wind_dir_cos'] = np.cos(2 * np.pi * df_merged['windDirection'] / 360.0)
+
+    # --- Simulation of Indoor Environment (Enhanced with occupancy proxy) ---
     np.random.seed(42)
     # Indoor Temp: slightly lag and dampen outdoor temp
     df_merged['indoor_temp'] = df_merged['airTemperature'].rolling(window=3, min_periods=1).mean() + np.random.normal(0, 0.5, len(df_merged))
     # Indoor Humidity: derived from dew point and air temp
     df_merged['indoor_humidity'] = 100 * (np.exp((17.625 * df_merged['dewTemperature']) / (243.04 + df_merged['dewTemperature'])) / 
                                         np.exp((17.625 * df_merged['airTemperature']) / (243.04 + df_merged['airTemperature'])))
-    # Indoor CO2: simulate based on occupancy (proxy: power usage)
-    df_merged['indoor_co2'] = 400 + (df_merged['power_usage'] / df_merged['power_usage'].max()) * 600 + np.random.normal(0, 20, len(df_merged))
+    # Indoor CO2: occupancy-driven simulation
+    # Using total_electricity as a better proxy for occupancy than just cooling power
+    occ_proxy = df_merged['total_electricity'] if 'total_electricity' in df_merged.columns else df_merged['power_usage']
+    df_merged['indoor_co2'] = 400 + (occ_proxy / occ_proxy.max()) * 600 + np.random.normal(0, 20, len(df_merged))
     
     return df_merged
 

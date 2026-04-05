@@ -36,23 +36,23 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
 # --- API Tags Metadata for better documentation ---
 tags_metadata = [
     {
-        "name": "认证管理",
+        "name": "用户认证",
         "description": "用于系统安全访问控制，获取和管理 OAuth2 令牌。",
     },
     {
-        "name": "环境感知",
+        "name": "数据监测",
         "description": "处理来自 IoT 设备和传感器的实时监测数据，包括温湿度、CO2 和能耗。",
     },
     {
-        "name": "智能预测",
+        "name": "负荷预测",
         "description": "利用 **GAT-LSTM (图注意力网络+长短期记忆网络)** 深度学习模型，对未来负荷进行高精度预测。",
     },
     {
-        "name": "优化控制",
+        "name": "智能优化",
         "description": "基于 **MOPSO (多目标粒子群算法)** 在节能与舒适度之间寻找最佳平衡点。",
     },
     {
-        "name": "系统配置",
+        "name": "系统管理",
         "description": "管理 AI 控制模式开关及系统运行参数。",
     },
 ]
@@ -425,27 +425,26 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
 
     def fitness_func(x):
         setpoint = x[0]
-        # --- IMPROVED ENERGY MODEL (Physical-Based) ---
-        # load * (1 + 0.15 * delta) + base_power
+        # --- PHASE 5 UPGRADE: Consistent Physical Models ---
         cooling_demand = max(0, 26 - setpoint)
-        base_power = 20.0 
+        # Use the more realistic linear-plus-base-load model
+        base_power = 20.0
         energy = real_predicted_load * (1.0 + 0.15 * cooling_demand) + base_power
         
-        # --- IMPROVED COMFORT MODEL (Squared Penalty) ---
-        pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
-        # Penalty increases sharply outside the [-0.5, 0.5] range
-        comfort_penalty = (pmv ** 2) * 100.0 
+        # Use consistent PMV parameters (icl=0.7, m=1.1, tr=ta+1.0)
+        pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+        comfort_penalty = (pmv ** 2) * 50.0 
         return [energy, comfort_penalty]
 
     mopso = MOPSO(fitness_func, bounds=[[18, 26]], num_particles=30, max_iter=20)
     pareto_front = mopso.solve()
     
-    # --- ROBUST PARETO SELECTION (Comfort Constraint) ---
+    # --- PHASE 5: Consistent Pareto Selection ---
     # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.5)
     acceptable_sols = []
     for p in pareto_front:
         sp = p['position'][0]
-        pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
         if abs(pmv_val) <= 0.5:
             acceptable_sols.append(p)
     
@@ -453,7 +452,7 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
     if not acceptable_sols:
         for p in pareto_front:
             sp = p['position'][0]
-            pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.8:
                 acceptable_sols.append(p)
                 

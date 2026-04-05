@@ -107,7 +107,18 @@ def run_pipeline():
         forecast_len = 12
         
         model = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len).to(device)
-        criterion = nn.MSELoss()
+        
+        # --- PHASE 5 UPGRADE: Weighted MSE Loss ---
+        # Prioritize power_usage (index 0) to reduce SMAPE from 63% to a reasonable range.
+        # target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
+        loss_weights = torch.tensor([5.0, 1.0, 1.0, 1.0]).to(device)
+        
+        def weighted_mse_loss(input, target, weights):
+            # input/target: [batch, seq, output_size]
+            sq_err = (input - target) ** 2
+            weighted_err = sq_err * weights
+            return torch.mean(weighted_err)
+
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
         # Enhanced Training Loop: Teacher Forcing, Validation, Early Stopping
@@ -132,7 +143,8 @@ def run_pipeline():
                 
                 optimizer.zero_grad()
                 out = model(batch_X, adj=adj_tensor, y=batch_y, teacher_forcing_ratio=tf_ratio)
-                loss = criterion(out, batch_y)
+                # Use weighted loss
+                loss = weighted_mse_loss(out, batch_y, loss_weights)
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
@@ -141,7 +153,7 @@ def run_pipeline():
             model.eval()
             with torch.no_grad():
                 val_out = model(X_test, adj=adj_tensor) 
-                val_loss = criterion(val_out, y_test)
+                val_loss = weighted_mse_loss(val_out, y_test, loss_weights)
             
             avg_train_loss = epoch_loss / (len(X_train)/batch_size)
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss.item():.6f}, TF Ratio: {tf_ratio:.2f}")
@@ -190,22 +202,43 @@ def run_pipeline():
         def hvac_fitness(x):
             # x[0] is setpoint temperature
             setpoint = x[0]
-            # 1. Energy model: Non-linear cooling demand
+            # --- PHASE 5 UPGRADE: Consistent Physical Models ---
             cooling_demand = max(0, 26 - setpoint)
-            energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
+            # Use the more realistic linear-plus-base-load model
+            base_power = 20.0
+            energy = real_predicted_load * (1.0 + 0.15 * cooling_demand) + base_power
             
-            # 2. Comfort model: PMV (Predicted Mean Vote)
-            # Standard parameters: v=0.1m/s, m=1.0met, icl=0.5clo
-            pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
-            comfort_penalty = abs(pmv) # Target is PMV = 0
+            # Use consistent PMV parameters (icl=0.7, m=1.1, tr=ta+1.0)
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            comfort_penalty = (pmv ** 2) * 50.0 
             
             return [energy, comfort_penalty]
         
         mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20) 
         pareto = mopso.solve()
+        
+        # --- PHASE 5: Consistent Pareto Selection ---
+        acceptable_sols = []
+        for p in pareto:
+            sp = p['position'][0]
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            if abs(pmv_val) <= 0.5:
+                acceptable_sols.append(p)
+        
+        if not acceptable_sols:
+            for p in pareto:
+                sp = p['position'][0]
+                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+                if abs(pmv_val) <= 0.8:
+                    acceptable_sols.append(p)
+        
+        if acceptable_sols:
+            best_sol = min(acceptable_sols, key=lambda p: p['fitness'][0])
+        else:
+            best_sol = min(pareto, key=lambda p: p['fitness'][1])
+            
         print(f"MOPSO solved. Found {len(pareto)} Pareto-optimal control points.")
-        best_comfort_sol = min(pareto, key=lambda p: p['fitness'][1])
-        print(f"Sample recommendation (Best PMV={best_comfort_sol['fitness'][1]:.2f}): {best_comfort_sol['position'][0]:.2f}C")
+        print(f"Sample recommendation (Best Acceptable Energy): {best_sol['position'][0]:.2f}C (PMV penalty: {best_sol['fitness'][1]:.2f})")
 
         # 4. CSV Backtest Simulation (Evaluation)
         print("\n[Step 4/4] Starting CSV-based Backtest Simulation (AI vs Baseline)...")

@@ -25,10 +25,10 @@ class GraphSageLayer(nn.Module):
 
 # Phase 3: Graph Attention Network (GAT) Layer
 class GATLayer(nn.Module):
-    def __init__(self, in_features, out_features, heads=4):
+    def __init__(self, in_features, out_features, heads=1):
         super(GATLayer, self).__init__()
         self.heads = heads
-        self.out_features = out_features // heads
+        self.out_features = out_features
         self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
         nn.init.xavier_uniform_(self.W.data, gain=1.414)
         self.a = nn.Parameter(torch.zeros(size=(2 * self.out_features, 1)))
@@ -47,6 +47,7 @@ class GATLayer(nn.Module):
         # a_input: [B, N, N, 2*out_feat]
         Wh_repeat = Wh.repeat_interleave(N, dim=1) # [B, N*N, out_feat]
         Wh_tile = Wh.repeat(1, N, 1) # [B, N*N, out_feat]
+        # Fixed Phase 5: Ensure view dimensions match concatenated features
         a_input = torch.cat([Wh_repeat, Wh_tile], dim=2).view(B, N, N, 2 * self.out_features)
         
         e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3)) # [B, N, N]
@@ -106,9 +107,12 @@ class LSTM_ED_Model(nn.Module):
         super(LSTM_ED_Model, self).__init__()
         self.num_nodes = num_nodes if num_nodes is not None else input_size
         
-        # Integration of GAT to capture spatial/feature correlations
-        # We treat each feature as a "node" in the graph
-        self.gat = GATLayer(in_features=1, out_features=1, heads=1) 
+        # Phase 5 Upgrade: High-dimensional Node Embedding for GAT
+        # By projecting features from 1 to 16 dimensions, the GAT can learn complex 
+        # inter-sensor relationships more effectively than with a single scalar value.
+        self.node_embed = nn.Linear(1, 16)
+        self.gat = GATLayer(in_features=16, out_features=16, heads=1) 
+        self.node_proj = nn.Linear(16, 1)
         
         self.encoder = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.decoder_cell = nn.LSTMCell(output_size, hidden_size)
@@ -130,6 +134,9 @@ class LSTM_ED_Model(nn.Module):
         # h_in: [batch_size * seq_len, input_size, 1]
         h_in = x.view(batch_size * seq_len, input_size, 1)
         
+        # Phase 5: Feature Embedding -> GAT -> Projection
+        h_emb = self.node_embed(h_in) # [B*S, N, 16]
+        
         # Expand adj for the flattened dimension if it's 2D
         if adj.dim() == 2:
             adj_expanded = adj.unsqueeze(0).expand(batch_size * seq_len, -1, -1)
@@ -137,11 +144,11 @@ class LSTM_ED_Model(nn.Module):
             adj_expanded = adj
             
         # Parallel GAT computation
-        # h_out: [batch_size * seq_len, input_size, 1]
-        h_out = self.gat(h_in, adj_expanded)
+        h_out = self.gat(h_emb, adj_expanded) # [B*S, N, 16]
+        h_final = self.node_proj(h_out) # [B*S, N, 1]
         
         # Restore dimensions to [batch_size, seq_len, input_size]
-        x_gnn = h_out.squeeze(-1).view(batch_size, seq_len, input_size)
+        x_gnn = h_final.squeeze(-1).view(batch_size, seq_len, input_size)
         
         _, (h, c) = self.encoder(x_gnn)
         h, c = h[0], c[0] # [batch_size, hidden_size]
