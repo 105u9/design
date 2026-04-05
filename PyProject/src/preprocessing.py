@@ -72,6 +72,18 @@ def load_building_data(building_id, site_id, meter_type='chilledwater'):
     # Merge on timestamp
     df_merged = pd.merge(df_weather, df_meter[['timestamp', building_id]], on='timestamp')
     df_merged = df_merged.rename(columns={building_id: 'power_usage'})
+
+    # --- NEW: Simulate Indoor Environment Variables for Graduation Requirement ---
+    # In a real IoT scenario, these would come from MQTT or TRNSYS.
+    # Here we derive them with some noise for training/testing.
+    np.random.seed(42)
+    # Indoor Temp: slightly lag and dampen outdoor temp
+    df_merged['indoor_temp'] = df_merged['airTemperature'].rolling(window=3, min_periods=1).mean() + np.random.normal(0, 0.5, len(df_merged))
+    # Indoor Humidity: derived from dew point and air temp
+    df_merged['indoor_humidity'] = 100 * (np.exp((17.625 * df_merged['dewTemperature']) / (243.04 + df_merged['dewTemperature'])) / 
+                                        np.exp((17.625 * df_merged['airTemperature']) / (243.04 + df_merged['airTemperature'])))
+    # Indoor CO2: simulate based on occupancy (proxy: power usage)
+    df_merged['indoor_co2'] = 400 + (df_merged['power_usage'] / df_merged['power_usage'].max()) * 600 + np.random.normal(0, 20, len(df_merged))
     
     return df_merged
 

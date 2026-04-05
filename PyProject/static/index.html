@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HVAC &#26234;&#33021;&#25511;&#21046;&#30417;&#25511;&#22823;&#23631;</title>
+    <title>HVAC 智能控制监控大屏</title>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <style>
         body { font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; }
@@ -27,32 +27,32 @@
 </head>
 <body>
     <div class="header">
-        <h1>HVAC &#26234;&#33021;&#25511;&#21046;&#30417;&#25511;&#22823;&#23631;</h1>
+        <h1>HVAC 智能控制监控大屏</h1>
         <div class="switch-container">
-            <span class="status-text">AI &#25511;&#21046;&#27169;&#24335;</span>
+            <span class="status-text">AI 控制模式</span>
             <label class="switch">
                 <input type="checkbox" id="aiToggle" checked onchange="handleToggle(this.checked)">
                 <span class="slider"></span>
             </label>
-            <span id="aiStatus" style="color: #4caf50; font-weight: bold;">&#24320;&#21551;</span>
+            <span id="aiStatus" style="color: #4caf50; font-weight: bold;">已开启</span>
         </div>
     </div>
 
     <div class="dashboard">
         <div class="card">
-            <div class="card-title">&#23454;&#26102;&#29615;&#22659;&#30417;&#27979; (&#28201;&#24230; & &#28287;&#24230;)</div>
+            <div class="card-title">实时环境监测 (温度 & 湿度)</div>
             <div id="envChart" style="width: 100%; height: 350px;"></div>
         </div>
         <div class="card">
-            <div class="card-title">&#23454;&#26102;&#33021;&#32791;&#36235;&#21183; (kW)</div>
+            <div class="card-title">实时能耗趋势 (kW)</div>
             <div id="energyChart" style="width: 100%; height: 350px;"></div>
         </div>
         <div class="card">
-            <div class="card-title">&#26410;&#26469; 12 &#23567;&#26102;&#36127;&#33655;&#39044;&#27979; (LSTM)</div>
+            <div class="card-title">未来 12 小时负载预测 (LSTM)</div>
             <div id="predictChart" style="width: 100%; height: 350px;"></div>
         </div>
         <div class="card">
-            <div class="card-title">AI &#20248;&#21270;&#35774;&#23450;&#20540;&#24314;&#35758; (MOPSO)</div>
+            <div class="card-title">AI 优化设定值建议 (MOPSO)</div>
             <div id="controlChart" style="width: 100%; height: 350px;"></div>
         </div>
     </div>
@@ -88,10 +88,10 @@
             const toggleEl = document.getElementById('aiToggle');
             toggleEl.checked = isAiEnabled;
             if (isAiEnabled) {
-                statusEl.innerText = "\u5df2\u5f00\u542f"; // "�ѿ���"
+                statusEl.innerText = "已开启";
                 statusEl.style.color = "#4caf50";
             } else {
-                statusEl.innerText = "\u5df2\u5173\u95ed"; // "�ѹر�"
+                statusEl.innerText = "已关闭";
                 statusEl.style.color = "#f44336";
             }
         }
@@ -104,14 +104,17 @@
                 const predRes = await fetch('/api/v1/predict', { method: 'POST', headers });
                 const predData = await predRes.json();
 
+                const optRes = await fetch('/api/v1/optimize', { method: 'POST', headers });
+                const optData = await optRes.json();
+
                 updateStatusUI(data.system.ai_mode);
-                updateCharts(data.history, predData);
+                updateCharts(data.history, predData, optData);
             } catch (err) {
                 console.error("Data fetch failed", err);
             }
         }
 
-        function updateCharts(history, prediction) {
+        function updateCharts(history, prediction, optimization) {
             // Environment Chart
             envChart.setOption({
                 tooltip: { 
@@ -119,17 +122,17 @@
                     formatter: function(params) {
                         let res = params[0].name + '<br/>';
                         params.forEach(item => {
-                            res += item.marker + item.seriesName + ': ' + item.value.toFixed(1) + (item.seriesName.includes('\u6e29') ? ' \u2103' : ' %') + '<br/>';
+                            res += item.marker + item.seriesName + ': ' + item.value.toFixed(1) + (item.seriesName.includes('温') ? ' ℃' : ' %') + '<br/>';
                         });
                         return res;
                     }
                 },
-                legend: { data: ['\u6e29\u5ea6', '\u6e7f\u5ea6'] },
+                legend: { data: ['温度', '湿度'] },
                 xAxis: { type: 'category', data: history.map(d => d.timestamp.split(' ')[1]) },
                 yAxis: { type: 'value' },
                 series: [
-                    { name: '\u6e29\u5ea6', type: 'line', data: history.map(d => d.temperature), smooth: true, color: '#ff7043' },
-                    { name: '\u6e7f\u5ea6', type: 'line', data: history.map(d => d.humidity), smooth: true, color: '#26c6da' }
+                    { name: '温度', type: 'line', data: history.map(d => d.temperature), smooth: true, color: '#ff7043' },
+                    { name: '湿度', type: 'line', data: history.map(d => d.humidity), smooth: true, color: '#26c6da' }
                 ]
             });
 
@@ -141,7 +144,7 @@
                 },
                 xAxis: { type: 'category', data: history.map(d => d.timestamp.split(' ')[1]) },
                 yAxis: { type: 'value' },
-                series: [{ name: '\u33021\u32791', type: 'bar', data: history.map(d => d.power), color: '#5c6bc0' }]
+                series: [{ name: '能耗', type: 'bar', data: history.map(d => d.power), color: '#5c6bc0' }]
             });
 
             // Prediction Chart
@@ -152,37 +155,38 @@
                 },
                 xAxis: { type: 'category', data: prediction.forecast_horizon },
                 yAxis: { type: 'value' },
-                series: [{ name: '\u39044\u27979\u36127\u33655', type: 'line', lineStyle: { type: 'dashed' }, data: prediction.predicted_load, color: '#66bb6a' }]
+                series: [{ name: '预测负载', type: 'line', lineStyle: { type: 'dashed' }, data: prediction.predicted_load, color: '#66bb6a' }]
             });
 
-            // AI Control Chart
+            // AI Control Chart (Gauge)
+            const isAi = optimization.mode === "AI_OPTIMIZED";
             controlChart.setOption({
                 tooltip: { 
                     trigger: 'item',
-                    formatter: '{a}<br/>{b}: {c} \u2103'
+                    formatter: '{a}<br/>{b}: {c} ℃'
                 },
                 series: [{
                     type: 'gauge',
-                    name: 'AI \u20248\u21270\u63a8\u8350', // "AI �Ż��Ƽ�"
+                    name: isAi ? 'AI 优化推荐' : '基准固定设定值',
                     startAngle: 180,
                     endAngle: 0,
                     min: 18,
                     max: 26,
-                    itemStyle: { color: '#ff9800' },
+                    itemStyle: { color: isAi ? '#4caf50' : '#9e9e9e' },
                     progress: { show: true, width: 8 },
                     pointer: { show: true },
                     axisTick: { show: false },
                     axisLabel: { distance: -40, color: '#999', fontSize: 12 },
                     data: [{ 
-                        value: 22.5, 
-                        name: '\u63a8\u8350\u6e29\u5ea6' // "�Ƽ��¶�"
+                        value: optimization.supply_air_setpoint, 
+                        name: isAi ? 'AI 推荐温度' : '基准模式'
                     }]
                 }]
             });
         }
 
         fetchData();
-        setInterval(fetchData, 5000);
+        setInterval(fetchData, 2000); // 缩短刷新间隔至 2 秒，增强动态感
     </script>
 </body>
 </html>

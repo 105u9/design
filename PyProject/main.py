@@ -19,18 +19,18 @@ import torch.optim as optim
 import pandas as pd
 import numpy as np
 
-def prepare_sequences(df, target_col, seq_len=24, forecast_len=12):
+def prepare_sequences(df, target_cols, seq_len=24, forecast_len=12):
     # Exclude timestamp and site_id
     numeric_df = df.select_dtypes(include=[np.number])
     data = numeric_df.values
-    target_idx = numeric_df.columns.get_loc(target_col)
+    target_idxs = [numeric_df.columns.get_loc(col) for col in target_cols]
     
     X, y = [], []
     for i in range(len(data) - seq_len - forecast_len):
         X.append(data[i:i+seq_len])
-        y.append(data[i+seq_len:i+seq_len+forecast_len, target_idx])
+        y.append(data[i+seq_len:i+seq_len+forecast_len, target_idxs])
         
-    return torch.FloatTensor(np.array(X)), torch.FloatTensor(np.array(y)).unsqueeze(-1)
+    return torch.FloatTensor(np.array(X)), torch.FloatTensor(np.array(y))
 
 def run_pipeline():
     print("=== Starting Graduation Project Pipeline ===")
@@ -56,8 +56,10 @@ def run_pipeline():
         print(f"Data loading complete for building: {building_id}")
         
         # 2. Algorithm & Model (Phase 3)
-        print("\n[Step 2/4] Training LSTM Prediction Model (Encoder-Decoder) on Full Dataset...")
-        X, y = prepare_sequences(df_normalized, target_col='power_usage')
+        # Requirement: Predict multi-dimensional environmental parameters
+        target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
+        print(f"\n[Step 2/4] Training LSTM Prediction Model (Encoder-Decoder) for: {target_cols}")
+        X, y = prepare_sequences(df_normalized, target_cols=target_cols)
         
         # Split into train/test (80/20)
         train_size = int(len(X) * 0.8)
@@ -66,7 +68,7 @@ def run_pipeline():
         
         input_size = X.shape[2]
         hidden_size = 64
-        output_size = 1 # predicting power_usage
+        output_size = len(target_cols) # predicting multi-dimensional
         forecast_len = 12
         
         model = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len).to(device)
@@ -111,13 +113,15 @@ def run_pipeline():
         with torch.no_grad():
             # Get real recent data for prediction
             last_seq = X[-1:].to(device)
-            predicted_load_scaled = model(last_seq).mean().item()
+            # Predict for the power_usage channel (index 0 in output)
+            predicted_load_scaled = model(last_seq)[0, :, 0].mean().item()
             
             # De-normalize predicted load properly using scaler
             dummy_pred = np.zeros((1, X.shape[2]))
-            target_idx = df_normalized.select_dtypes(include=[np.number]).columns.get_loc('power_usage')
-            dummy_pred[0, target_idx] = predicted_load_scaled
-            real_predicted_load = scaler.inverse_transform(dummy_pred)[0, target_idx]
+            target_idxs = [df_normalized.select_dtypes(include=[np.number]).columns.get_loc(col) for col in target_cols]
+            power_target_idx = target_idxs[0] # power_usage
+            dummy_pred[0, power_target_idx] = predicted_load_scaled
+            real_predicted_load = scaler.inverse_transform(dummy_pred)[0, power_target_idx]
             
         def hvac_fitness(x):
             # x[0] is setpoint temperature
@@ -137,7 +141,7 @@ def run_pipeline():
 
         # 4. CSV Backtest Simulation (Evaluation)
         print("\n[Step 4/4] Starting CSV-based Backtest Simulation (AI vs Baseline)...")
-        saving_rate = run_backtest(model, X_test, y_test, scaler, target_idx, steps=24)
+        saving_rate = run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24)
         print(f"\nFinal Saving Rate: {saving_rate:.2f}%")
         print("Backtest simulation complete. Results saved to 'src/evaluation_report.png'.")
 
@@ -150,18 +154,34 @@ def run_pipeline():
 
 def start_api():
     print("\n=== Starting FastAPI Backend ===")
-    print("API URL: http://localhost:8000")
-    print("Interactive Docs: http://localhost:8000/docs")
+    print("Local URL: http://localhost:8000")
     print("Web Dashboard: http://localhost:8000/static/index.html")
+    print("Interactive Docs: http://localhost:8000/docs")
+    print("-" * 50)
+    print("Note: Do NOT use http://0.0.0.0:8000 in your browser.")
+    print("Please use http://localhost:8000 instead.")
+    print("-" * 50)
     # Add a tip about encoding
     print("Tip: If the web dashboard shows garbled characters, please clear browser cache or use Ctrl+F5.")
     from api import app
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
 
+def start_trnsys():
+    print("\n=== Starting TRNSYS Bridge (Closed-Loop Control) ===")
+    from trnsys_utils import simulate_trnsys_loop
+    simulate_trnsys_loop(None, None)
+
+def start_mqtt():
+    print("\n=== Starting MQTT IoT Sensor Simulation ===")
+    from simulate_iot import simulate_iot_publisher
+    simulate_iot_publisher()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HVAC Intelligent Control System - Main Program")
-    parser.add_argument("--run", action="store_true", help="Run the full pipeline")
-    parser.add_argument("--api", action="store_true", help="Start the backend API")
+    parser.add_argument("--run", action="store_true", help="运行训练与回测全流程 (Run full pipeline)")
+    parser.add_argument("--api", action="store_true", help="启动 FastAPI 后端服务 (Start backend API)")
+    parser.add_argument("--mqtt", action="store_true", help="启动 MQTT IoT 模拟发布 (Start MQTT IoT Simulation)")
+    parser.add_argument("--trnsys", action="store_true", help="启动 TRNSYS 联合仿真接口 (Start TRNSYS Bridge)")
     
     args = parser.parse_args()
     
@@ -169,8 +189,15 @@ if __name__ == "__main__":
         run_pipeline()
     elif args.api:
         start_api()
+    elif args.mqtt:
+        start_mqtt()
+    elif args.trnsys:
+        start_trnsys()
     else:
-        print("Please use arguments:")
-        print("  python main.py --run   # Run the training and optimization pipeline")
-        print("  python main.py --api   # Start the backend API")
+        print("请使用以下参数运行程序 (Please use arguments):")
+        print("  python main.py --run      # 运行训练与优化回测流程")
+        print("  python main.py --api      # 启动监控后端与可视化大屏")
+        print("  python main.py --mqtt     # 启动工业物联网 (MQTT) 模拟数据流")
+        print("  python main.py --trnsys   # 启动 TRNSYS 动态闭环仿真接口")
+        # Default to run pipeline if no args provided to avoid confusion
         run_pipeline()

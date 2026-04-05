@@ -8,11 +8,17 @@ from optimization import MOPSO
 def calculate_metrics(y_true, y_pred):
     """Calculate RMSE and MAPE for model evaluation"""
     rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-    # Avoid division by zero or very small values in MAPE
-    mape = np.mean(np.abs((y_true - y_pred) / np.where(np.abs(y_true) < 1e-5, 1e-5, y_true))) * 100
+    
+    # Calculate MAPE only for non-zero values to avoid astronomical percentages
+    # This is common in HVAC where power can be zero at night
+    mask = np.abs(y_true) > 0.1 # Threshold for "significant" power
+    if np.any(mask):
+        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+    else:
+        mape = 0.0
     return rmse, mape
 
-def run_backtest(model, X_test, y_test, scaler, target_idx, steps=24):
+def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24):
     """
     Perform a data-driven backtest on the test set.
     Compares AI control (MOPSO) with Baseline control (Fixed Setpoint).
@@ -22,25 +28,28 @@ def run_backtest(model, X_test, y_test, scaler, target_idx, steps=24):
     
     # 0. Initial model error evaluation
     with torch.no_grad():
-        preds_scaled = model(X_test[:steps].to(device)).cpu().numpy() # [steps, forecast_len, 1]
-        y_true_scaled = y_test[:steps].cpu().numpy() # [steps, forecast_len, 1]
+        preds_scaled = model(X_test[:steps].to(device)).cpu().numpy() # [steps, forecast_len, output_size]
+        y_true_scaled = y_test[:steps].cpu().numpy() # [steps, forecast_len, output_size]
         
-        # De-normalize for real error calculation
         num_features = X_test.shape[2]
-        dummy_true = np.zeros((steps * 12, num_features))
-        dummy_pred = np.zeros((steps * 12, num_features))
+        output_size = len(target_cols)
         
-        # Power usage target column index passed from main
-        dummy_true[:, target_idx] = y_true_scaled.flatten()
-        dummy_pred[:, target_idx] = preds_scaled.flatten()
-        
-        y_real = scaler.inverse_transform(dummy_true)[:, target_idx]
-        y_pred = scaler.inverse_transform(dummy_pred)[:, target_idx]
-        
-        rmse, mape = calculate_metrics(y_real, y_pred)
-        print(f"\nModel Performance on Test Set (First {steps} windows):")
-        print(f" - RMSE: {rmse:.4f} kW")
-        print(f" - MAPE: {mape:.2f}%")
+        print(f"\n[Multi-dimensional Prediction] Performance on Test Set (First {steps} windows):")
+        for i, col_name in enumerate(target_cols):
+            # De-normalize for real error calculation
+            dummy_true = np.zeros((steps * 12, num_features))
+            dummy_pred = np.zeros((steps * 12, num_features))
+            
+            t_idx = target_idxs[i]
+            dummy_true[:, t_idx] = y_true_scaled[:, :, i].flatten()
+            dummy_pred[:, t_idx] = preds_scaled[:, :, i].flatten()
+            
+            y_real = scaler.inverse_transform(dummy_true)[:, t_idx]
+            y_pred = scaler.inverse_transform(dummy_pred)[:, t_idx]
+            
+            rmse, mape = calculate_metrics(y_real, y_pred)
+            unit = "kW" if "power" in col_name else ("C" if "temp" in col_name else ("%" if "humidity" in col_name else "ppm"))
+            print(f" - {col_name}: RMSE: {rmse:.4f} {unit}, MAPE: {mape:.2f}%")
 
     # Storage for results
     ai_setpoints = []
@@ -51,6 +60,10 @@ def run_backtest(model, X_test, y_test, scaler, target_idx, steps=24):
     baseline_energy = []
     baseline_comfort = []
     
+    # Power usage target index for energy calculation
+    power_idx_in_y = target_cols.index('power_usage')
+    power_target_idx = target_idxs[power_idx_in_y]
+
     print(f"\nStarting CSV-based Backtest for {steps} steps...")
     
     for i in range(steps):
@@ -58,12 +71,13 @@ def run_backtest(model, X_test, y_test, scaler, target_idx, steps=24):
         # Predict load for current sequence
         with torch.no_grad():
             current_X = X_test[i:i+1].to(device)
-            predicted_load_scaled = model(current_X).mean().item()
+            # Take the first target (power_usage) mean for optimization
+            predicted_load_scaled = model(current_X)[0, :, power_idx_in_y].mean().item()
             
             # De-normalize predicted load properly using scaler
             dummy_p = np.zeros((1, num_features))
-            dummy_p[0, target_idx] = predicted_load_scaled
-            real_predicted_load = scaler.inverse_transform(dummy_p)[0, target_idx]
+            dummy_p[0, power_target_idx] = predicted_load_scaled
+            real_predicted_load = scaler.inverse_transform(dummy_p)[0, power_target_idx]
             
         def hvac_fitness(x):
             setpoint = x[0]
