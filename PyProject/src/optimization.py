@@ -159,17 +159,16 @@ if __name__ == "__main__":
 
     def hvac_fitness(x):
         setpoint = x[0]
-        # --- IMPROVED ENERGY MODEL (Physical-Based) ---
-        # load * (delta ^ 1.2) / 10 + base_operating_power (e.g., fans, pumps)
-        # Delta is (outdoor - indoor), simplified here as (26 - setpoint)
+        # --- PHASE 5 UPGRADE: Consistent Physical Models ---
+        # ?????¡Â???????: energy = load * (demand ** 1.2) / 10 + base_power
         cooling_demand = max(0, 26 - setpoint)
-        # 5.0kW base power + 10.0kW minimum if AC is 'active'
-        base_power = 15.0 if cooling_demand > 0.1 else 5.0
+        # 20.0kW base operating power
+        base_power = 20.0
         energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + base_power
         
-        # --- IMPROVED COMFORT MODEL (Squared Penalty) ---
-        # PMV-based comfort: Exponential/Squared penalty for PMV deviation from 0
-        pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        # --- PMV Parameters Alignment (ISO 7730) ---
+        # Consistent parameters: icl=0.7 (clothing), m=1.1 (metabolic), tr=ta+1.0 (radiant)
+        pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
         # Penalty increases sharply outside the [-0.5, 0.5] range
         comfort_penalty = (pmv ** 2) * 50.0 
         
@@ -179,20 +178,20 @@ if __name__ == "__main__":
     pareto = mopso.solve()
     
     # --- ROBUST PARETO SELECTION (Comfort Constraint) ---
-    # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.8)
+    # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.5)
     acceptable_sols = []
     for p in pareto:
         sp = p['position'][0]
-        pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
-        if abs(pmv_val) <= 0.8:
+        pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+        if abs(pmv_val) <= 0.5:
             acceptable_sols.append(p)
     
-    # 2. If no solution meets |PMV| <= 0.8, relax to 1.0
+    # 2. Relax if needed
     if not acceptable_sols:
         for p in pareto:
             sp = p['position'][0]
-            pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
-            if abs(pmv_val) <= 1.0:
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            if abs(pmv_val) <= 0.8:
                 acceptable_sols.append(p)
                 
     # 3. Select the best energy saving point from acceptable ones

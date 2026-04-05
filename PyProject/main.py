@@ -111,7 +111,7 @@ def run_pipeline():
         # --- PHASE 5 UPGRADE: Weighted MSE Loss ---
         # Prioritize power_usage (index 0) to reduce SMAPE from 63% to a reasonable range.
         # target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
-        loss_weights = torch.tensor([5.0, 1.0, 1.0, 1.0]).to(device)
+        loss_weights = torch.tensor([10.0, 1.0, 1.0, 1.0]).to(device)
         
         def weighted_mse_loss(input, target, weights):
             # input/target: [batch, seq, output_size]
@@ -203,10 +203,10 @@ def run_pipeline():
             # x[0] is setpoint temperature
             setpoint = x[0]
             # --- PHASE 5 UPGRADE: Consistent Physical Models ---
+            # ͳһ���÷����Թ�ʽ: energy = load * (demand ** 1.2) / 10 + base_power
             cooling_demand = max(0, 26 - setpoint)
-            # Use the more realistic linear-plus-base-load model
             base_power = 20.0
-            energy = real_predicted_load * (1.0 + 0.15 * cooling_demand) + base_power
+            energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + base_power
             
             # Use consistent PMV parameters (icl=0.7, m=1.1, tr=ta+1.0)
             pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)

@@ -29,10 +29,17 @@ class GATLayer(nn.Module):
         super(GATLayer, self).__init__()
         self.heads = heads
         self.out_features = out_features
-        self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
-        nn.init.xavier_uniform_(self.W.data, gain=1.414)
-        self.a = nn.Parameter(torch.zeros(size=(2 * self.out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+        
+        # Create multiple attention heads
+        self.attentions = nn.ModuleList()
+        for _ in range(heads):
+            self.attentions.append(nn.Linear(in_features * 2, 1))
+        
+        self.W = nn.Linear(in_features, out_features)
+        nn.init.xavier_uniform_(self.W.weight, gain=1.414)
+        for attention in self.attentions:
+            nn.init.xavier_uniform_(attention.weight, gain=1.414)
+        
         self.leakyrelu = nn.LeakyReLU(0.2)
 
     def forward(self, h, adj):
@@ -42,33 +49,39 @@ class GATLayer(nn.Module):
             h = h.unsqueeze(0)
             
         B, N, _ = h.size()
-        Wh = torch.matmul(h, self.W) # [B, N, out_feat]
         
-        # a_input: [B, N, N, 2*out_feat]
-        Wh_repeat = Wh.repeat_interleave(N, dim=1) # [B, N*N, out_feat]
-        Wh_tile = Wh.repeat(1, N, 1) # [B, N*N, out_feat]
-        # Fixed Phase 5: Ensure view dimensions match concatenated features
-        a_input = torch.cat([Wh_repeat, Wh_tile], dim=2).view(B, N, N, 2 * self.out_features)
+        # Apply linear transformation
+        Wh = self.W(h) # [B, N, out_feat]
         
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3)) # [B, N, N]
-
-        # Improved Masking for Numerical Stability
-        # adj should be [N, N] or [B, N, N]
-        if adj.dim() == 2:
-            adj = adj.unsqueeze(0).expand(B, -1, -1)
+        # Calculate attention scores
+        # For each head, compute attention separately
+        head_outs = []
+        for attention in self.attentions:
+            # Calculate attention scores for all pairs
+            a_input = torch.cat([Wh.repeat(1, N, 1), Wh.repeat_interleave(N, dim=1)], dim=2)
+            a_input = a_input.view(B, N, N, -1)
+            e = self.leakyrelu(attention(a_input).squeeze(3)) # [B, N, N]
             
-        # Masking: Use a very large negative value for non-edges before Softmax
-        mask = (adj == 0)
-        attention = e.masked_fill(mask, float('-inf'))
-        attention = torch.softmax(attention, dim=2)
+            # Masking
+            if adj.dim() == 2:
+                adj_mask = adj.unsqueeze(0).expand(B, -1, -1)
+            else:
+                adj_mask = adj
+            mask = (adj_mask == 0)
+            e = e.masked_fill(mask, float('-inf'))
+            
+            # Softmax
+            attention = torch.softmax(e, dim=2)
+            attention = torch.where(torch.isnan(attention), torch.zeros_like(attention), attention)
+            
+            # Apply attention
+            head_out = torch.matmul(attention, Wh) # [B, N, out_feat]
+            head_outs.append(head_out)
         
-        # Handle cases where a node has no neighbors (all -inf in a row)
-        # Softmax of all -inf is NaN, so we replace NaNs with 0
-        attention = torch.where(torch.isnan(attention), torch.zeros_like(attention), attention)
+        # Average across heads
+        out = torch.mean(torch.stack(head_outs), dim=0) # [B, N, out_feat]
+        out = torch.relu(out)
         
-        h_prime = torch.matmul(attention, Wh) # [B, N, out_feat]
-
-        out = torch.relu(h_prime)
         return out if is_batched else out.squeeze(0)
 
 # Phase 3: Node2Vec Embedding (Simplified)
@@ -111,7 +124,7 @@ class LSTM_ED_Model(nn.Module):
         # By projecting features from 1 to 16 dimensions, the GAT can learn complex 
         # inter-sensor relationships more effectively than with a single scalar value.
         self.node_embed = nn.Linear(1, 16)
-        self.gat = GATLayer(in_features=16, out_features=16, heads=1) 
+        self.gat = GATLayer(in_features=16, out_features=16, heads=4) 
         self.node_proj = nn.Linear(16, 1)
         
         self.encoder = nn.LSTM(input_size, hidden_size, batch_first=True)

@@ -58,11 +58,38 @@
     </div>
 
     <script>
-        const TOKEN = "fake-super-secret-token";
-        const headers = { 
-            'Authorization': `Bearer ${TOKEN}`,
+        let token = "";
+        let headers = { 
             'Content-Type': 'application/json'
         };
+
+        // 模拟静默登录获取真实 Token
+        async function loginAndInitialize() {
+            const formData = new URLSearchParams();
+            formData.append('username', 'admin');
+            formData.append('password', 'admin123');
+            
+            try {
+                const loginRes = await fetch('/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: formData
+                });
+                if (!loginRes.ok) throw new Error("Login failed");
+                const loginData = await loginRes.json();
+                token = loginData.access_token;
+                
+                // 更新全局 headers
+                headers['Authorization'] = `Bearer ${token}`;
+                
+                // 登录成功后启动数据轮询
+                fetchData();
+                setInterval(fetchData, 2000);
+            } catch (error) {
+                console.error("系统初始化登录失败:", error);
+                alert("系统鉴权失败，请检查后端运行状态。");
+            }
+        }
 
         // Initialize charts once
         const envChart = echarts.init(document.getElementById('envChart'));
@@ -185,8 +212,7 @@
             });
         }
 
-        fetchData();
-        setInterval(fetchData, 2000); // 缩短刷新间隔至 2 秒，增强动态感
+        loginAndInitialize();
     </script>
 </body>
 </html>

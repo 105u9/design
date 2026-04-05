@@ -112,8 +112,9 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
             # tr = ta + 1.0 (Radiation heat from equipment/windows)
             pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
             
-            # Penalty logic: use squared error but with a small scaling factor to avoid numerical explosion
-            comfort_penalty = (pmv ** 2) * 50.0 
+            # Penalty logic: use squared error with a more balanced scaling factor
+            # Huber-like penalty to avoid numerical explosion
+            comfort_penalty = min((pmv ** 2) * 20.0, 100.0)
             return [energy, comfort_penalty]
             
         mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20)
