@@ -118,16 +118,22 @@ class LSTM_ED_Model(nn.Module):
             # Default to fully connected graph between features
             adj = torch.ones((input_size, input_size)).to(x.device)
             
-        # Process each time step through GAT (spatial/feature interaction)
-        # x_gnn: [batch_size, seq_len, input_size]
-        x_gnn_list = []
-        for t in range(seq_len):
-            # Treat each feature as a node with 1-dim feature
-            h_t = x[:, t, :].unsqueeze(-1) # [batch_size, input_size, 1]
-            h_t_gat = self.gat(h_t, adj) # [batch_size, input_size, 1]
-            x_gnn_list.append(h_t_gat.squeeze(-1).unsqueeze(1))
+        # Optimization: Flatten batch and sequence to process all through GAT in parallel
+        # h_in: [batch_size * seq_len, input_size, 1]
+        h_in = x.view(batch_size * seq_len, input_size, 1)
+        
+        # Expand adj for the flattened dimension if it's 2D
+        if adj.dim() == 2:
+            adj_expanded = adj.unsqueeze(0).expand(batch_size * seq_len, -1, -1)
+        else:
+            adj_expanded = adj
             
-        x_gnn = torch.cat(x_gnn_list, dim=1) # [batch_size, seq_len, input_size]
+        # Parallel GAT computation
+        # h_out: [batch_size * seq_len, input_size, 1]
+        h_out = self.gat(h_in, adj_expanded)
+        
+        # Restore dimensions to [batch_size, seq_len, input_size]
+        x_gnn = h_out.squeeze(-1).view(batch_size, seq_len, input_size)
         
         _, (h, c) = self.encoder(x_gnn)
         h, c = h[0], c[0] # [batch_size, hidden_size]

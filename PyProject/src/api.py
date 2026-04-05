@@ -36,16 +36,38 @@ if os.path.exists("src/data_scaler.pkl"):
     scaler = joblib.load("src/data_scaler.pkl")
     logger.info("Loaded scaler from src/data_scaler.pkl")
 
+# Device Detection
+cuda_available = torch.cuda.is_available()
+device = torch.device("cuda" if cuda_available else "cpu")
+logger.info(f"API Device Selection: {device}")
+if not cuda_available:
+    logger.warning("NVIDIA GPU not detected by PyTorch. Using CPU for API inference. If you have a GPU, please install the CUDA-enabled version of PyTorch.")
+else:
+    logger.info(f"API CUDA Enabled: {torch.cuda.get_device_name(0)}")
+
+# Load real data for demo and to determine model input size
+try:
+    from preprocessing import load_building_data, clean_and_impute, normalize_data
+    df_raw = load_building_data("Panther_office_Karla", "Panther")
+    df_real = clean_and_impute(df_raw, method='mean')
+    real_samples = df_real.to_dict('records')
+    # Dynamically determine the number of numeric features
+    dynamic_input_size = df_real.select_dtypes(include=[np.number]).shape[1]
+    logger.info(f"Determined dynamic input size: {dynamic_input_size}")
+except Exception as e:
+    logger.warning(f"Could not load real samples for dynamic sizing: {e}")
+    real_samples = []
+    dynamic_input_size = 8 # Fallback
+
 model_instance = None
 try:
-    # Load trained model
-    input_size = 8 # BDG2 numeric features
+    # Load trained model using dynamic input size
     hidden_size = 64
     output_size = 1
     forecast_len = 12
-    model_instance = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len)
+    model_instance = LSTM_ED_Model(dynamic_input_size, hidden_size, output_size, forecast_len).to(device)
     if os.path.exists("src/lstm_model.pth"):
-        model_instance.load_state_dict(torch.load("src/lstm_model.pth"))
+        model_instance.load_state_dict(torch.load("src/lstm_model.pth", map_location=device))
     model_instance.eval()
 except Exception as e:
     logger.warning(f"Could not load LSTM model: {e}")
@@ -85,16 +107,6 @@ system_state = {
     "ai_mode": True,
     "last_update": datetime.now().isoformat()
 }
-
-from preprocessing import load_building_data, clean_and_impute, normalize_data
-
-# Load real data for demo
-try:
-    df_raw = load_building_data("Panther_office_Karla", "Panther")
-    df_real = clean_and_impute(df_raw, method='mean')
-    real_samples = df_real.to_dict('records')
-except:
-    real_samples = []
 
 def initialize_demo_data():
     now = datetime.now()
@@ -184,7 +196,7 @@ def predict_load(current_user: dict = Depends(get_current_user)):
                 
                 # IMPORTANT: Normalize input using the trained scaler
                 recent_data_scaled = scaler.transform(recent_df)
-                input_tensor = torch.FloatTensor(recent_data_scaled).unsqueeze(0) # [1, 24, num_features]
+                input_tensor = torch.FloatTensor(recent_data_scaled).unsqueeze(0).to(device) # [1, 24, num_features]
                 
                 with torch.no_grad():
                     pred = model_instance(input_tensor) # Output shape: [1, 12, 1]

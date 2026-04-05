@@ -35,8 +35,17 @@ def prepare_sequences(df, target_col, seq_len=24, forecast_len=12):
 def run_pipeline():
     print("=== Starting Graduation Project Pipeline ===")
     
+    # Device Detection
+    cuda_available = torch.cuda.is_available()
+    device = torch.device("cuda" if cuda_available else "cpu")
+    print(f"Device Selection: {device}")
+    if not cuda_available:
+        print("Note: NVIDIA GPU not detected. Using CPU. To enable CUDA, ensure NVIDIA drivers and the correct PyTorch version are installed.")
+    else:
+        print(f"CUDA Enabled: {torch.cuda.get_device_name(0)}")
+    
     # 1. Data Preprocessing (Phase 2)
-    print("\n[Step 1/3] Preprocessing building data (Building Genome Project 2)...")
+    print("\n[Step 1/4] Preprocessing building data (Building Genome Project 2)...")
     building_id = "Panther_office_Karla"
     site_id = "Panther"
     
@@ -47,7 +56,7 @@ def run_pipeline():
         print(f"Data loading complete for building: {building_id}")
         
         # 2. Algorithm & Model (Phase 3)
-        print("\n[Step 2/3] Training LSTM Prediction Model (Encoder-Decoder) on Full Dataset...")
+        print("\n[Step 2/4] Training LSTM Prediction Model (Encoder-Decoder) on Full Dataset...")
         X, y = prepare_sequences(df_normalized, target_col='power_usage')
         
         # Split into train/test (80/20)
@@ -60,7 +69,7 @@ def run_pipeline():
         output_size = 1 # predicting power_usage
         forecast_len = 12
         
-        model = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len)
+        model = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len).to(device)
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
@@ -73,8 +82,8 @@ def run_pipeline():
             model.train()
             epoch_loss = 0
             for i in range(0, len(X_train), batch_size):
-                batch_X = X_train[i:i+batch_size]
-                batch_y = y_train[i:i+batch_size]
+                batch_X = X_train[i:i+batch_size].to(device)
+                batch_y = y_train[i:i+batch_size].to(device)
                 
                 optimizer.zero_grad()
                 out = model(batch_X)
@@ -86,8 +95,8 @@ def run_pipeline():
             # Validation
             model.eval()
             with torch.no_grad():
-                test_out = model(X_test[:100]) # Sample test
-                test_loss = criterion(test_out, y_test[:100])
+                test_out = model(X_test[:100].to(device)) # Sample test
+                test_loss = criterion(test_out, y_test[:100].to(device))
                 
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss/(len(X_train)/batch_size):.6f}, Val Loss: {test_loss.item():.6f}")
             
@@ -96,12 +105,12 @@ def run_pipeline():
         print("Model and scaler saved to src/.")
 
         # 3. Optimization Strategy (Phase 4)
-        print("\n[Step 3/3] Running MOPSO optimization (Energy vs Comfort)...")
+        print("\n[Step 3/4] Running MOPSO optimization (Energy vs Comfort)...")
         # Use the trained model to predict future load for a given setpoint
         model.eval()
         with torch.no_grad():
             # Get real recent data for prediction
-            last_seq = X[-1:].to(torch.float32)
+            last_seq = X[-1:].to(device)
             predicted_load_scaled = model(last_seq).mean().item()
             
             # De-normalize predicted load properly using scaler
@@ -128,7 +137,7 @@ def run_pipeline():
 
         # 4. CSV Backtest Simulation (Evaluation)
         print("\n[Step 4/4] Starting CSV-based Backtest Simulation (AI vs Baseline)...")
-        saving_rate = run_backtest(model, X_test, y_test, scaler, steps=24)
+        saving_rate = run_backtest(model, X_test, y_test, scaler, target_idx, steps=24)
         print(f"\nFinal Saving Rate: {saving_rate:.2f}%")
         print("Backtest simulation complete. Results saved to 'src/evaluation_report.png'.")
 

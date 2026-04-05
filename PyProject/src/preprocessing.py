@@ -14,6 +14,9 @@ def load_data(file_path):
     return df
 
 def clean_and_impute(df, method='knn'):
+    # Ensure we work on a copy to avoid SettingWithCopyWarning
+    df = df.copy()
+    
     # Drop columns with too many missing values (e.g., > 50%)
     threshold = 0.5 * len(df)
     df = df.dropna(axis=1, thresh=threshold)
@@ -22,10 +25,12 @@ def clean_and_impute(df, method='knn'):
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     
     if method == 'mean':
-        df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
+        # Use fillna on numeric columns and update via .loc
+        df.loc[:, numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].mean())
     elif method == 'knn':
         imputer = KNNImputer(n_neighbors=5)
-        df[numeric_cols] = imputer.fit_transform(df[numeric_cols])
+        # Use imputer and update via .loc
+        df.loc[:, numeric_cols] = imputer.fit_transform(df[numeric_cols])
     
     return df
 

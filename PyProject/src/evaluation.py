@@ -8,19 +8,21 @@ from optimization import MOPSO
 def calculate_metrics(y_true, y_pred):
     """Calculate RMSE and MAPE for model evaluation"""
     rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-    mape = np.mean(np.abs((y_true - y_pred) / np.where(y_true == 0, 1e-10, y_true))) * 100
+    # Avoid division by zero or very small values in MAPE
+    mape = np.mean(np.abs((y_true - y_pred) / np.where(np.abs(y_true) < 1e-5, 1e-5, y_true))) * 100
     return rmse, mape
 
-def run_backtest(model, X_test, y_test, scaler, steps=24):
+def run_backtest(model, X_test, y_test, scaler, target_idx, steps=24):
     """
     Perform a data-driven backtest on the test set.
     Compares AI control (MOPSO) with Baseline control (Fixed Setpoint).
     """
+    device = next(model.parameters()).device
     model.eval()
     
     # 0. Initial model error evaluation
     with torch.no_grad():
-        preds_scaled = model(X_test[:steps]).cpu().numpy() # [steps, forecast_len, 1]
+        preds_scaled = model(X_test[:steps].to(device)).cpu().numpy() # [steps, forecast_len, 1]
         y_true_scaled = y_test[:steps].cpu().numpy() # [steps, forecast_len, 1]
         
         # De-normalize for real error calculation
@@ -28,11 +30,7 @@ def run_backtest(model, X_test, y_test, scaler, steps=24):
         dummy_true = np.zeros((steps * 12, num_features))
         dummy_pred = np.zeros((steps * 12, num_features))
         
-        # Assume power_usage is the target column
-        # In a real scenario, we'd need the column index from the dataframe
-        # Here we'll assume index 0 for power_usage or use a common fallback
-        target_idx = 0 
-        
+        # Power usage target column index passed from main
         dummy_true[:, target_idx] = y_true_scaled.flatten()
         dummy_pred[:, target_idx] = preds_scaled.flatten()
         
@@ -59,7 +57,7 @@ def run_backtest(model, X_test, y_test, scaler, steps=24):
         # 1. AI Control Strategy
         # Predict load for current sequence
         with torch.no_grad():
-            current_X = X_test[i:i+1].to(torch.float32)
+            current_X = X_test[i:i+1].to(device)
             predicted_load_scaled = model(current_X).mean().item()
             
             # De-normalize predicted load properly using scaler
@@ -97,8 +95,8 @@ def run_backtest(model, X_test, y_test, scaler, steps=24):
         ai_energy.append(best_sol['fitness'][0])
         ai_comfort.append(best_sol['fitness'][1])
         
-        # 2. Baseline Control Strategy (Fixed 22.0C)
-        base_setpoint = 22.0
+        # 2. Baseline Control Strategy (Fixed 24.0C)
+        base_setpoint = 24.0
         cooling_demand_base = max(0, 26 - base_setpoint)
         base_e = real_predicted_load * (cooling_demand_base ** 1.2) / 10.0 + 5.0
         base_c = abs(base_setpoint - 22.5)
