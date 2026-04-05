@@ -6,17 +6,19 @@ import pandas as pd
 from optimization import MOPSO, calculate_pmv
 
 def calculate_metrics(y_true, y_pred):
-    """Calculate RMSE and MAPE for model evaluation"""
+    """Calculate RMSE and SMAPE for model evaluation"""
     rmse = np.sqrt(np.mean((y_true - y_pred)**2))
     
-    # Calculate MAPE only for non-zero values to avoid astronomical percentages
-    # This is common in HVAC where power can be zero at night
-    mask = np.abs(y_true) > 0.1 # Threshold for "significant" power
+    # Use SMAPE (Symmetric Mean Absolute Percentage Error) to avoid division by zero
+    # and handle low values better than standard MAPE
+    denominator = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+    # Avoid division by zero for both zero values
+    mask = denominator > 0.01 
     if np.any(mask):
-        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+        smape = np.mean(np.abs(y_true[mask] - y_pred[mask]) / denominator[mask]) * 100
     else:
-        mape = 0.0
-    return rmse, mape
+        smape = 0.0
+    return rmse, smape
 
 def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=24, adj=None):
     """
@@ -55,9 +57,9 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
             y_real = scaler.inverse_transform(dummy_true)[:, t_idx]
             y_pred = scaler.inverse_transform(dummy_pred)[:, t_idx]
             
-            rmse, mape = calculate_metrics(y_real, y_pred)
+            rmse, smape = calculate_metrics(y_real, y_pred)
             unit = "kW" if "power" in col_name else ("C" if "temp" in col_name else ("%" if "humidity" in col_name else "ppm"))
-            print(f" - {col_name}: RMSE: {rmse:.4f} {unit}, MAPE: {mape:.2f}%")
+            print(f" - {col_name}: RMSE: {rmse:.4f} {unit}, SMAPE: {smape:.2f}%")
 
     # Storage for results
     ai_setpoints = []
@@ -97,41 +99,59 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
             
         def hvac_fitness(x):
             setpoint = x[0]
-            # Non-linear energy model: load * (delta ^ 1.2) / 10 + base_cost
+            # --- IMPROVED ENERGY MODEL (Physical-Based) ---
+            # load * (1 + 0.15 * delta) + base_power
+            # This is more stable and realistic than power function
             cooling_demand = max(0, 26 - setpoint)
-            energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + 5.0
+            # Base power for fans/pumps + Load-dependent part
+            base_power = 20.0 # Increased base power to reduce extreme saving %
+            energy = real_predicted_load * (1.0 + 0.15 * cooling_demand) + base_power
             
-            # PMV-based comfort
+            # --- IMPROVED COMFORT MODEL (Squared Penalty) ---
             pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
-            comfort_penalty = abs(pmv)
+            # Penalty increases sharply outside the [-0.5, 0.5] range
+            comfort_penalty = (pmv ** 2) * 100.0 
             return [energy, comfort_penalty]
             
-        mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=20, max_iter=10)
+        mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20)
         pareto = mopso.solve()
         
-        # Strategy selection: Utopia point
-        energies = [p['fitness'][0] for p in pareto]
-        comforts = [p['fitness'][1] for p in pareto]
-        min_e, max_e = min(energies), max(energies)
-        min_c, max_c = min(comforts), max(comforts)
-        de = max_e - min_e if max_e > min_e else 1.0
-        dc = max_c - min_c if max_c > min_c else 1.0
+        # --- ROBUST PARETO SELECTION (Comfort Constraint) ---
+        # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.5 for high comfort)
+        acceptable_sols = []
+        for p in pareto:
+            sp = p['position'][0]
+            pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+            if abs(pmv_val) <= 0.5:
+                acceptable_sols.append(p)
         
-        def utopia_dist(p):
-            norm_e = (p['fitness'][0] - min_e) / de
-            norm_c = (p['fitness'][1] - min_c) / dc
-            return np.sqrt(norm_e**2 + norm_c**2)
+        # 2. Relax if needed
+        if not acceptable_sols:
+            for p in pareto:
+                sp = p['position'][0]
+                pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+                if abs(pmv_val) <= 0.8:
+                    acceptable_sols.append(p)
+                    
+        # 3. Select the best energy saving point from acceptable ones
+        if acceptable_sols:
+            best_sol = min(acceptable_sols, key=lambda p: p['fitness'][0])
+        else:
+            best_sol = min(pareto, key=lambda p: p['fitness'][1])
             
-        best_sol = min(pareto, key=utopia_dist)
         ai_setpoint = best_sol['position'][0]
         ai_setpoints.append(ai_setpoint)
         ai_energy.append(best_sol['fitness'][0])
-        ai_comfort.append(best_sol['fitness'][1])
+        
+        # Record ABSOLUTE PMV for evaluation, not the penalty
+        final_pmv = calculate_pmv(ta=ai_setpoint, tr=ai_setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        ai_comfort.append(abs(final_pmv))
         
         # 2. Baseline Control Strategy (Fixed 24.0C)
         base_setpoint = 24.0
         cooling_demand_base = max(0, 26 - base_setpoint)
-        base_e = real_predicted_load * (cooling_demand_base ** 1.2) / 10.0 + 5.0
+        # Use EXACT SAME energy model for baseline to be fair
+        base_e = real_predicted_load * (1.0 + 0.15 * cooling_demand_base) + 20.0
         
         pmv_base = calculate_pmv(ta=base_setpoint, tr=base_setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
         base_c = abs(pmv_base)

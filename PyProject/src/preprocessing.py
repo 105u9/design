@@ -17,6 +17,15 @@ def clean_and_impute(df, method='knn'):
     # Ensure we work on a copy to avoid SettingWithCopyWarning
     df = df.copy()
     
+    # --- NEW: Extract Time Features for Graduation Requirement ---
+    # Help LSTM identify occupancy and daily patterns
+    if 'timestamp' in df.columns:
+        df['hour'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        # Use sin/cos for cyclical features to represent time better
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
+    
     # Drop columns with too many missing values (e.g., > 50%)
     threshold = 0.5 * len(df)
     df = df.dropna(axis=1, thresh=threshold)

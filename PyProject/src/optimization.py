@@ -153,12 +153,54 @@ def recommend_config(current_state, history_states, history_configs):
     return history_configs[best_idx], similarities[best_idx]
 
 if __name__ == "__main__":
-    # Example fitness function: f1 = x^2, f2 = (x-2)^2
-    def example_fitness(x):
-        return [x[0]**2, (x[0]-2)**2]
+    # Example values for demonstration
+    real_predicted_load = 50.0
+    real_predicted_rh = 50.0
+
+    def hvac_fitness(x):
+        setpoint = x[0]
+        # --- IMPROVED ENERGY MODEL (Physical-Based) ---
+        # load * (delta ^ 1.2) / 10 + base_operating_power (e.g., fans, pumps)
+        # Delta is (outdoor - indoor), simplified here as (26 - setpoint)
+        cooling_demand = max(0, 26 - setpoint)
+        # 5.0kW base power + 10.0kW minimum if AC is 'active'
+        base_power = 15.0 if cooling_demand > 0.1 else 5.0
+        energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + base_power
+        
+        # --- IMPROVED COMFORT MODEL (Squared Penalty) ---
+        # PMV-based comfort: Exponential/Squared penalty for PMV deviation from 0
+        pmv = calculate_pmv(ta=setpoint, tr=setpoint, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        # Penalty increases sharply outside the [-0.5, 0.5] range
+        comfort_penalty = (pmv ** 2) * 50.0 
+        
+        return [energy, comfort_penalty]
+        
+    mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20)
+    pareto = mopso.solve()
     
-    mopso = MOPSO(example_fitness, [[-10, 10]])
-    pareto_front = mopso.solve()
-    print(f"Found {len(pareto_front)} points on Pareto front.")
-    for p in pareto_front[:5]:
-        print(f"Position: {p['position']}, Fitness: {p['fitness']}")
+    # --- ROBUST PARETO SELECTION (Comfort Constraint) ---
+    # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.8)
+    acceptable_sols = []
+    for p in pareto:
+        sp = p['position'][0]
+        pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+        if abs(pmv_val) <= 0.8:
+            acceptable_sols.append(p)
+    
+    # 2. If no solution meets |PMV| <= 0.8, relax to 1.0
+    if not acceptable_sols:
+        for p in pareto:
+            sp = p['position'][0]
+            pmv_val = calculate_pmv(ta=sp, tr=sp, rh=real_predicted_rh, v=0.1, m=1.0, icl=0.5)
+            if abs(pmv_val) <= 1.0:
+                acceptable_sols.append(p)
+                
+    # 3. Select the best energy saving point from acceptable ones
+    if acceptable_sols:
+        best_sol = min(acceptable_sols, key=lambda p: p['fitness'][0])
+    else:
+        # Fallback to the one with minimum comfort deviation if still none
+        best_sol = min(pareto, key=lambda p: p['fitness'][1])
+        
+    ai_setpoint = best_sol['position'][0]
+    print(f"Optimized HVAC Setpoint: {ai_setpoint:.2f}C")
