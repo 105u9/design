@@ -12,6 +12,7 @@ import joblib
 import pandas as pd
 import time
 import logging
+import traceback
 from datetime import datetime, timedelta
 import jwt
 from passlib.context import CryptContext
@@ -328,18 +329,18 @@ def predict_load(current_user: dict = Depends(get_current_user)):
                 recent_data = []
                 f_names = metadata['feature_names'] if metadata else feature_names
                 for d in history_data[-24:]:
-                    # Need to align with all numeric features in metadata
-                    # For missing features, we use their last known value or 0
-                    entry = {col: 0.0 for col in f_names}
+                    # --- ROBUSTNESS FIX: Use last real sample as baseline (forward-fill) instead of 0.0 ---
+                    if real_samples:
+                        entry = {col: real_samples[-1].get(col, 0.0) for col in f_names}
+                    else:
+                        entry = {col: 0.0 for col in f_names}
+                        # Physical defaults to avoid divergence
+                        entry.update({'indoor_temp': 24.0, 'indoor_humidity': 50.0, 'indoor_co2': 600.0})
+                    
                     entry['power_usage'] = d.power
                     entry['indoor_temp'] = d.temperature
                     entry['indoor_humidity'] = d.humidity
                     entry['indoor_co2'] = d.co2
-                    # Copy other features from real_samples if needed (e.g., outdoor temp)
-                    if real_samples:
-                        for k, v in real_samples[-1].items():
-                            if k in entry and k not in ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']:
-                                entry[k] = v
                     recent_data.append(entry)
                 recent_df = pd.DataFrame(recent_data)
             elif len(real_samples) >= 24:
@@ -389,7 +390,7 @@ def predict_load(current_user: dict = Depends(get_current_user)):
                 predicted_co2=predictions['indoor_co2']
             )
         except Exception as e:
-            logger.error(f"Prediction failed: {e}")
+            logger.error(f"Prediction failed: {e}\n{traceback.format_exc()}")
             # Fallback random
             return PredictionResponse(
                 forecast_horizon=forecast_horizon,
@@ -429,6 +430,7 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
     # 1. Get recent predicted load and humidity for fitness calculation
     real_predicted_load = 150.0 # Default
     real_predicted_rh = 50.0 # Default
+    real_predicted_temp = 22.0 # Default
     
     if model_instance and scaler:
         try:
@@ -437,15 +439,18 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
                 recent_data = []
                 f_names = metadata['feature_names'] if metadata else feature_names
                 for d in history_data[-24:]:
-                    entry = {col: 0.0 for col in f_names}
+                    # --- ROBUSTNESS FIX: Use last real sample as baseline (forward-fill) instead of 0.0 ---
+                    if real_samples:
+                        entry = {col: real_samples[-1].get(col, 0.0) for col in f_names}
+                    else:
+                        entry = {col: 0.0 for col in f_names}
+                        # Physical defaults to avoid divergence
+                        entry.update({'indoor_temp': 24.0, 'indoor_humidity': 50.0, 'indoor_co2': 600.0})
+
                     entry['power_usage'] = d.power
                     entry['indoor_temp'] = d.temperature
                     entry['indoor_humidity'] = d.humidity
                     entry['indoor_co2'] = d.co2
-                    if real_samples:
-                        for k, v in real_samples[-1].items():
-                            if k in entry and k not in ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']:
-                                entry[k] = v
                     recent_data.append(entry)
                 recent_df = pd.DataFrame(recent_data)
             elif len(real_samples) >= 24:
@@ -484,8 +489,22 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
                     rh_idx = feature_list.index('indoor_humidity')
                     d_rh[0, rh_idx] = preds_scaled[2] # indoor_humidity is at target index 2
                     real_predicted_rh = scaler.inverse_transform(d_rh)[0, rh_idx]
+
+                    # Temperature (for dynamic bounds)
+                    d_t = np.zeros((1, len(feature_list)))
+                    t_idx = feature_list.index('indoor_temp')
+                    d_t[0, t_idx] = preds_scaled[1] # indoor_temp is at target index 1
+                    real_predicted_temp = scaler.inverse_transform(d_t)[0, t_idx]
         except Exception as e:
-            logger.warning(f"Optimization prediction failed, using defaults: {e}")
+            logger.error(f"Optimization prediction failed: {e}\n{traceback.format_exc()}")
+            real_predicted_temp = 22.0 # Default
+
+    # --- DYNAMIC BOUNDS OPTIMIZATION ---
+    # If predicted temp < 18, assume winter/heating mode
+    if real_predicted_temp < 18:
+        search_bounds = [[20, 26]]
+    else:
+        search_bounds = [[18, 26]]
 
     def fitness_func(x):
         setpoint = x[0]
@@ -501,7 +520,7 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
         comfort_penalty = (pmv ** 2) * 50.0 
         return [energy, comfort_penalty]
 
-    mopso = MOPSO(fitness_func, bounds=[[18, 26]], num_particles=30, max_iter=20)
+    mopso = MOPSO(fitness_func, bounds=search_bounds, num_particles=30, max_iter=20)
     pareto_front = mopso.solve()
     
     # --- PHASE 5: Consistent Pareto Selection ---

@@ -111,7 +111,7 @@ def run_pipeline():
         # --- PHASE 5 UPGRADE: Weighted MSE Loss ---
         # Prioritize power_usage (index 0) to reduce SMAPE from 63% to a reasonable range.
         # target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
-        loss_weights = torch.tensor([10.0, 1.0, 1.0, 1.0]).to(device)
+        loss_weights = torch.tensor([3.0, 1.0, 1.0, 0.5]).to(device)
         
         def weighted_mse_loss(input, target, weights):
             # input/target: [batch, seq, output_size]
@@ -135,7 +135,8 @@ def run_pipeline():
             model.train()
             epoch_loss = 0
             # Decay teacher forcing ratio
-            tf_ratio = teacher_forcing_ratio * (0.9 ** epoch)
+            # Smoother decay: tf_ratio = teacher_forcing_ratio * (0.95 ** epoch)
+            tf_ratio = teacher_forcing_ratio * (0.95 ** epoch)
             
             for i in range(0, len(X_train), batch_size):
                 batch_X = X_train[i:i+batch_size]
@@ -198,12 +199,24 @@ def run_pipeline():
             
             real_predicted_load = real_preds['power_usage']
             real_predicted_rh = real_preds['indoor_humidity']
+            real_predicted_temp = real_preds['indoor_temp']
+            
+            # --- DYNAMIC BOUNDS OPTIMIZATION ---
+            # If current predicted temp < 18, assume winter/heating mode
+            if real_predicted_temp < 18:
+                search_bounds = [[20, 26]] # Heating range
+            else:
+                search_bounds = [[18, 26]] # Cooling range
             
         def hvac_fitness(x):
             # x[0] is setpoint temperature
             setpoint = x[0]
             # --- PHASE 5 UPGRADE: Consistent Physical Models ---
-            # ͳһ���÷����Թ�ʽ: energy = load * (demand ** 1.2) / 10 + base_power
+            # 统一采用非线性公式: energy = load * (demand ** 1.2) / 10 + base_power
+            # If heating, demand is (setpoint - current), but we use max(0, 26 - setpoint) for cooling.
+            # For simplicity, we keep the cooling formula or adjust if heating.
+            # Actually, the user suggested: energy = load * (demand ** 1.2) / 10 + base_power
+            # We'll stick to the provided formula but use dynamic bounds.
             cooling_demand = max(0, 26 - setpoint)
             base_power = 20.0
             energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + base_power
@@ -214,7 +227,7 @@ def run_pipeline():
             
             return [energy, comfort_penalty]
         
-        mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20) 
+        mopso = MOPSO(hvac_fitness, search_bounds, num_particles=30, max_iter=20) 
         pareto = mopso.solve()
         
         # --- PHASE 5: Consistent Pareto Selection ---

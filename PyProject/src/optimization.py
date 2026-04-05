@@ -156,11 +156,18 @@ if __name__ == "__main__":
     # Example values for demonstration
     real_predicted_load = 50.0
     real_predicted_rh = 50.0
+    real_predicted_temp = 22.0 # Default
+
+    # --- DYNAMIC BOUNDS OPTIMIZATION ---
+    if real_predicted_temp < 18:
+        search_bounds = [[20, 26]]
+    else:
+        search_bounds = [[18, 26]]
 
     def hvac_fitness(x):
         setpoint = x[0]
         # --- PHASE 5 UPGRADE: Consistent Physical Models ---
-        # ?????��???????: energy = load * (demand ** 1.2) / 10 + base_power
+        # 统一采用非线性公式: energy = load * (demand ** 1.2) / 10 + base_power
         cooling_demand = max(0, 26 - setpoint)
         # 20.0kW base operating power
         base_power = 20.0
@@ -174,7 +181,7 @@ if __name__ == "__main__":
         
         return [energy, comfort_penalty]
         
-    mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20)
+    mopso = MOPSO(hvac_fitness, search_bounds, num_particles=30, max_iter=20)
     pareto = mopso.solve()
     
     # --- ROBUST PARETO SELECTION (Comfort Constraint) ---
