@@ -33,7 +33,8 @@ class GATLayer(nn.Module):
         # Create multiple attention heads
         self.attentions = nn.ModuleList()
         for _ in range(heads):
-            self.attentions.append(nn.Linear(in_features * 2, 1))
+            # Corrected: attention should be applied on transformed features (out_features)
+            self.attentions.append(nn.Linear(out_features * 2, 1))
         
         self.W = nn.Linear(in_features, out_features)
         nn.init.xavier_uniform_(self.W.weight, gain=1.414)
@@ -57,10 +58,21 @@ class GATLayer(nn.Module):
         # For each head, compute attention separately
         head_outs = []
         for attention in self.attentions:
-            # Calculate attention scores for all pairs
-            a_input = torch.cat([Wh.repeat(1, N, 1), Wh.repeat_interleave(N, dim=1)], dim=2)
-            a_input = a_input.view(B, N, N, -1)
-            e = self.leakyrelu(attention(a_input).squeeze(3)) # [B, N, N]
+            # --- BROADCASTING OPTIMIZATION: Replacement for repeat/repeat_interleave ---
+            # attention.weight shape is [1, 2 * out_features]
+            a_left = attention.weight[:, :self.out_features].T  # [out_features, 1]
+            a_right = attention.weight[:, self.out_features:].T # [out_features, 1]
+            
+            # Source and target scores
+            e_left = torch.matmul(Wh, a_left)   # [B, N, 1]
+            e_right = torch.matmul(Wh, a_right) # [B, N, 1]
+            
+            # [B, N, 1] + [B, 1, N] -> [B, N, N]
+            e = e_left + e_right.transpose(1, 2)
+            if attention.bias is not None:
+                e = e + attention.bias
+            
+            e = self.leakyrelu(e)
             
             # Masking
             if adj.dim() == 2:
@@ -71,11 +83,12 @@ class GATLayer(nn.Module):
             e = e.masked_fill(mask, float('-inf'))
             
             # Softmax
-            attention = torch.softmax(e, dim=2)
-            attention = torch.where(torch.isnan(attention), torch.zeros_like(attention), attention)
+            # Use dim=2 for normalization over neighbors
+            attention_weights = torch.softmax(e, dim=2)
+            attention_weights = torch.where(torch.isnan(attention_weights), torch.zeros_like(attention_weights), attention_weights)
             
             # Apply attention
-            head_out = torch.matmul(attention, Wh) # [B, N, out_feat]
+            head_out = torch.matmul(attention_weights, Wh) # [B, N, out_feat]
             head_outs.append(head_out)
         
         # Average across heads

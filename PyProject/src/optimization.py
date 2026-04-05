@@ -16,7 +16,8 @@ def calculate_pmv(ta, tr, rh, v, m, icl):
     
     icl_m2k_w = 0.155 * icl
     m_w_m2 = m * 58.15
-    fcl = 1.0 + 0.2 * icl if icl <= 0.5 else 1.05 + 0.1 * icl
+    # Vectorized: fcl = 1.0 + 0.2 * icl if icl <= 0.5 else 1.05 + 0.1 * icl
+    fcl = np.where(icl <= 0.5, 1.0 + 0.2 * icl, 1.05 + 0.1 * icl)
     
     hcf = 12.1 * np.sqrt(v)
     taa = ta + 273.15
@@ -27,10 +28,11 @@ def calculate_pmv(ta, tr, rh, v, m, icl):
     
     # Heat loss components
     hl1 = 3.05e-3 * (5733 - 6.99 * (m_w_m2 - 58.15) - pa)
-    hl2 = 0.42 * (m_w_m2 - 58.15 - 58.15) if m_w_m2 > 58.15 else 0
+    # Vectorized: hl2 = 0.42 * (m_w_m2 - 58.15 - 58.15) if m_w_m2 > 58.15 else 0
+    hl2 = np.where(m_w_m2 > 58.15, 0.42 * (m_w_m2 - 58.15 - 58.15), 0.0)
     hl3 = 1.7e-5 * m_w_m2 * (5867 - pa)
     hl4 = 0.0014 * m_w_m2 * (34 - ta)
-    hl5 = 3.96e-8 * fcl * (pow(tcl + 273.15, 4) - pow(tra, 4))
+    hl5 = 3.96e-8 * fcl * (np.power(tcl + 273.15, 4) - np.power(tra, 4))
     hl6 = fcl * hcf * (tcl - ta)
     
     ts = 0.303 * np.exp(-0.036 * m_w_m2) + 0.028
@@ -86,21 +88,20 @@ class MOPSO:
                 archive[i]['crowding_distance'] += (archive[i+1]['fitness'][m] - archive[i-1]['fitness'][m]) / (f_max - f_min)
         return archive
 
-    def update_archive(self, particle):
-        fitness = self.fitness_func(particle.position)
+    def update_archive(self, particle_pos, particle_fit):
         is_p_dominated = False
         new_archive = []
         for arch_p in self.archive:
-            if self.is_dominated(arch_p['fitness'], fitness):
+            if self.is_dominated(arch_p['fitness'], particle_fit):
                 is_p_dominated = True
                 new_archive.append(arch_p)
-            elif self.is_dominated(fitness, arch_p['fitness']):
+            elif self.is_dominated(particle_fit, arch_p['fitness']):
                 pass # remove arch_p
             else:
                 new_archive.append(arch_p)
         
         if not is_p_dominated:
-            new_archive.append({'position': np.copy(particle.position), 'fitness': fitness})
+            new_archive.append({'position': np.copy(particle_pos), 'fitness': particle_fit})
             
         # Pruning the archive based on Crowding Distance if it exceeds max size
         if len(new_archive) > self.max_archive_size:
@@ -112,6 +113,11 @@ class MOPSO:
 
     def solve(self):
         for _ in range(self.max_iter):
+            # Pre-calculate crowding distance once per iteration if archive exists
+            if self.archive:
+                self.calculate_crowding_distance(self.archive)
+                self.archive.sort(key=lambda x: x['crowding_distance'], reverse=True)
+
             for p in self.particles:
                 # Update velocity and position
                 w, c1, c2 = 0.5, 1.5, 1.5
@@ -120,8 +126,7 @@ class MOPSO:
                 # Select a random leader from archive if available
                 if self.archive:
                     # Probabilistically select from the top 10% least crowded particles
-                    self.calculate_crowding_distance(self.archive)
-                    self.archive.sort(key=lambda x: x['crowding_distance'], reverse=True)
+                    # Re-calculate top_n because archive might have grown
                     top_n = max(1, int(len(self.archive) * 0.1))
                     leader = self.archive[np.random.randint(top_n)]['position']
                 else:
@@ -140,7 +145,7 @@ class MOPSO:
                     p.best_position = np.copy(p.position)
                     p.best_fitness = current_fitness
                 
-                self.update_archive(p)
+                self.update_archive(p.position, current_fitness)
         return self.archive
 
 # Phase 4: Cosine Similarity for Recommendation
@@ -167,7 +172,8 @@ if __name__ == "__main__":
     def hvac_fitness(x):
         setpoint = x[0]
         # --- PHASE 5 UPGRADE: Consistent Physical Models ---
-        # Áªü‰∏ÄÈááÁî®ÈùûÁ∫øÊÄßÂÖ¨Âºè: energy = load * (demand ** 1.2) / 10 + base_power
+        # Õ≥“ª≤…”√∑«œﬂ–‘π´ Ω: energy = load * (demand ** 1.2) / 10 + base_power
+        # In cooling mode, demand increases as setpoint decreases below 26°„C
         cooling_demand = max(0, 26 - setpoint)
         # 20.0kW base operating power
         base_power = 20.0

@@ -16,6 +16,7 @@ import joblib
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 import pandas as pd
 import numpy as np
 
@@ -53,15 +54,18 @@ def run_pipeline():
     
     try:
         df_raw = load_building_data(building_id, site_id)
-        df_cleaned = clean_and_impute(df_raw, method='mean')
         
-        # --- FIX: Split before normalization to avoid Data Leakage ---
-        train_size = int(len(df_cleaned) * 0.8)
-        df_train = df_cleaned.iloc[:train_size]
-        df_test = df_cleaned.iloc[train_size:]
+        # --- FIX: Split before imputation to avoid Data Leakage ---
+        train_size = int(len(df_raw) * 0.8)
+        df_train_raw = df_raw.iloc[:train_size]
+        df_test_raw = df_raw.iloc[train_size:]
+        
+        # Clean and impute separately
+        df_train = clean_and_impute(df_train_raw, method='mean')
+        df_test = clean_and_impute(df_test_raw, method='mean')
         
         # Fit scaler only on training data
-        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
+        numeric_cols = df_train.select_dtypes(include=[np.number]).columns
         from sklearn.preprocessing import StandardScaler
         scaler = StandardScaler()
         scaler.fit(df_train[numeric_cols])
@@ -125,22 +129,29 @@ def run_pipeline():
         epochs = 20 
         batch_size = 64
         best_val_loss = float('inf')
-        patience = 5
+        patience = 10
         trigger_times = 0
         teacher_forcing_ratio = 0.5 # Initial ratio
+        
+        # Prepare DataLoader for efficiency
+        train_dataset = TensorDataset(X_train, y_train)
+        # FIX: pin_memory=True only works with CPU tensors. 
+        # Since we already moved X_train to GPU if available, pin_memory must be False.
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                 num_workers=0, pin_memory=False)
         
         print(f"Starting enhanced training for {epochs} epochs on {len(X_train)} samples...")
         
         for epoch in range(epochs):
             model.train()
             epoch_loss = 0
-            # Decay teacher forcing ratio
-            # Smoother decay: tf_ratio = teacher_forcing_ratio * (0.95 ** epoch)
-            tf_ratio = teacher_forcing_ratio * (0.95 ** epoch)
+            # --- IMPROVED TEACHER FORCING DECAY: Linear decay ---
+            # From 0.5 to 0.1 over epochs
+            tf_ratio = max(0.1, 0.5 - (0.5 - 0.1) * (epoch / epochs))
             
-            for i in range(0, len(X_train), batch_size):
-                batch_X = X_train[i:i+batch_size]
-                batch_y = y_train[i:i+batch_size]
+            for batch_X, batch_y in train_loader:
+                if cuda_available: 
+                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
                 
                 optimizer.zero_grad()
                 out = model(batch_X, adj=adj_tensor, y=batch_y, teacher_forcing_ratio=tf_ratio)
@@ -148,7 +159,7 @@ def run_pipeline():
                 loss = weighted_mse_loss(out, batch_y, loss_weights)
                 loss.backward()
                 optimizer.step()
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * batch_X.size(0)
             
             # Validation
             model.eval()
@@ -156,7 +167,7 @@ def run_pipeline():
                 val_out = model(X_test, adj=adj_tensor) 
                 val_loss = weighted_mse_loss(val_out, y_test, loss_weights)
             
-            avg_train_loss = epoch_loss / (len(X_train)/batch_size)
+            avg_train_loss = epoch_loss / len(X_train)
             print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss.item():.6f}, TF Ratio: {tf_ratio:.2f}")
             
             # Save Best Model & Early Stopping
