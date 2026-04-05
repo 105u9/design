@@ -99,66 +99,68 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
             
         def hvac_fitness(x):
             setpoint = x[0]
-            # --- IMPROVED ENERGY MODEL (Physical-Based) ---
-            # load * (1 + 0.15 * delta) + base_power
-            # This is more stable and realistic than power function
-            cooling_demand = max(0, 26 - setpoint)
-            # Base power for fans/pumps + Load-dependent part
-            base_power = 20.0 # Increased base power to reduce extreme saving %
-            energy = real_predicted_load * (1.0 + 0.15 * cooling_demand) + base_power
+            v_speed = x[1]
             
-            # --- PHASE 5 UPGRADE: Realistic Office Comfort Model ---
-            # Parameters: icl=0.7 (Summer business casual), m=1.1 (Typical office activity)
-            # tr = ta + 1.0 (Radiation heat from equipment/windows)
-            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            # --- PHASE 6 UPGRADE: Thermodynamics-based Energy Model ---
+            # Q_demand (cooling load proxy) with T_out=35C
+            q_demand = real_predicted_load * ((max(0, 35.0 - setpoint) / (35.0 - 24.0)) ** 1.2)
+            # COP model: Higher setpoint leads to higher efficiency in cooling
+            cop = 3.0 + 0.1 * (setpoint - 18)
+            # Fan Power model: Proportional to cube of wind speed
+            p_fan = 10.0 * (v_speed ** 3)
+            base_power = 20.0
             
-            # Penalty logic: use squared error with a more balanced scaling factor
-            # Huber-like penalty to avoid numerical explosion
-            comfort_penalty = min((pmv ** 2) * 20.0, 100.0)
+            energy = (q_demand / cop) + p_fan + base_power
+            
+            # Use dynamic wind speed in PMV
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=v_speed, m=1.1, icl=0.7)
+            comfort_penalty = (pmv ** 2) * 50.0 
             return [energy, comfort_penalty]
             
-        mopso = MOPSO(hvac_fitness, [[18, 26]], num_particles=30, max_iter=20)
+        mopso = MOPSO(hvac_fitness, [[18, 26], [0.1, 1.0]], num_particles=30, max_iter=20)
         pareto = mopso.solve()
         
-        # --- ROBUST PARETO SELECTION (Comfort Constraint) ---
-        # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.5 for high comfort)
+        # --- PHASE 6: Consistent Pareto Selection ---
         acceptable_sols = []
         for p in pareto:
             sp = p['position'][0]
-            # Must use the SAME parameters as in fitness function for consistency
-            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            v_sp = p['position'][1]
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.5:
                 acceptable_sols.append(p)
         
-        # 2. Relax if needed
         if not acceptable_sols:
             for p in pareto:
                 sp = p['position'][0]
-                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+                v_sp = p['position'][1]
+                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
                 if abs(pmv_val) <= 0.8:
                     acceptable_sols.append(p)
                     
-        # 3. Select the best energy saving point from acceptable ones
         if acceptable_sols:
             best_sol = min(acceptable_sols, key=lambda p: p['fitness'][0])
         else:
             best_sol = min(pareto, key=lambda p: p['fitness'][1])
             
         ai_setpoint = best_sol['position'][0]
+        ai_wind_speed = best_sol['position'][1]
         ai_setpoints.append(ai_setpoint)
         ai_energy.append(best_sol['fitness'][0])
         
         # Record ABSOLUTE PMV for evaluation
-        final_pmv = calculate_pmv(ta=ai_setpoint, tr=ai_setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+        final_pmv = calculate_pmv(ta=ai_setpoint, tr=ai_setpoint + 1.0, rh=real_predicted_rh, v=ai_wind_speed, m=1.1, icl=0.7)
         ai_comfort.append(abs(final_pmv))
         
-        # 2. Baseline Control Strategy (Fixed 24.0C)
+        # 2. Baseline Control Strategy (Fixed 24.0C, 0.1m/s)
         base_setpoint = 24.0
-        cooling_demand_base = max(0, 26 - base_setpoint)
-        # Use EXACT SAME energy model for baseline to be fair
-        base_e = real_predicted_load * (1.0 + 0.15 * cooling_demand_base) + 20.0
+        base_v = 0.1
         
-        pmv_base = calculate_pmv(ta=base_setpoint, tr=base_setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+        q_demand_base = real_predicted_load * ((max(0, 35.0 - base_setpoint) / (35.0 - 24.0)) ** 1.2)
+        cop_base = 3.0 + 0.1 * (base_setpoint - 18)
+        p_fan_base = 10.0 * (base_v ** 3)
+        base_e = (q_demand_base / cop_base) + p_fan_base + 20.0
+        
+        pmv_base = calculate_pmv(ta=base_setpoint, tr=base_setpoint + 1.0, rh=real_predicted_rh, v=base_v, m=1.1, icl=0.7)
         base_c = abs(pmv_base)
         
         baseline_energy.append(base_e)

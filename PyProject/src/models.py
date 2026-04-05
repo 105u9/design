@@ -30,80 +30,69 @@ class GATLayer(nn.Module):
         self.heads = heads
         self.out_features = out_features
         
-        # Create multiple attention heads
-        self.attentions = nn.ModuleList()
-        for _ in range(heads):
-            # Corrected: attention should be applied on transformed features (out_features)
-            self.attentions.append(nn.Linear(out_features * 2, 1))
+        # Phase 6 Optimization: Vectorized Multi-head Attention
+        # Single linear layer to handle all heads simultaneously
+        self.attn_linear = nn.Linear(out_features * 2, heads, bias=False)
         
         self.W = nn.Linear(in_features, out_features)
         nn.init.xavier_uniform_(self.W.weight, gain=1.414)
-        for attention in self.attentions:
-            nn.init.xavier_uniform_(attention.weight, gain=1.414)
+        nn.init.xavier_uniform_(self.attn_linear.weight, gain=1.414)
         
         self.leakyrelu = nn.LeakyReLU(0.2)
 
     def forward(self, h, adj):
-        # h: [B, N, in_feat] or [N, in_feat]
+        # h: [B, N, in_feat]
         is_batched = h.dim() == 3
         if not is_batched:
             h = h.unsqueeze(0)
             
         B, N, _ = h.size()
         
-        # Apply linear transformation
-        Wh = self.W(h) # [B, N, out_feat]
+        # 1. Linear transformation: [B, N, out_feat]
+        Wh = self.W(h) 
         
-        # Calculate attention scores
-        # For each head, compute attention separately
-        head_outs = []
-        for attention in self.attentions:
-            # --- BROADCASTING OPTIMIZATION: Replacement for repeat/repeat_interleave ---
-            # attention.weight shape is [1, 2 * out_features]
-            a_left = attention.weight[:, :self.out_features].T  # [out_features, 1]
-            a_right = attention.weight[:, self.out_features:].T # [out_features, 1]
-            
-            # Source and target scores
-            e_left = torch.matmul(Wh, a_left)   # [B, N, 1]
-            e_right = torch.matmul(Wh, a_right) # [B, N, 1]
-            
-            # [B, N, 1] + [B, 1, N] -> [B, N, N]
-            e = e_left + e_right.transpose(1, 2)
-            if attention.bias is not None:
-                e = e + attention.bias
-            
-            e = self.leakyrelu(e)
-            
-            # Masking
-            if adj.dim() == 2:
-                adj_mask = adj.unsqueeze(0).expand(B, -1, -1)
-            else:
-                adj_mask = adj
-            mask = (adj_mask == 0)
-            e = e.masked_fill(mask, float('-inf'))
-            
-            # Softmax
-            # Use dim=2 for normalization over neighbors
-            attention_weights = torch.softmax(e, dim=2)
-            attention_weights = torch.where(torch.isnan(attention_weights), torch.zeros_like(attention_weights), attention_weights)
-            
-            # Apply attention
-            head_out = torch.matmul(attention_weights, Wh) # [B, N, out_feat]
-            head_outs.append(head_out)
+        # 2. Vectorized Attention calculation
+        # Wh_left/right: [B, N, heads, out_feat]
+        # Instead of repeat, we use broadcasting logic
+        # Extract weights for left and right parts: [heads, out_feat]
+        a_weights = self.attn_linear.weight # [heads, 2 * out_feat]
+        a_left = a_weights[:, :self.out_features].T  # [out_feat, heads]
+        a_right = a_weights[:, self.out_features:].T # [out_feat, heads]
         
-        # Average across heads
-        out = torch.mean(torch.stack(head_outs), dim=0) # [B, N, out_feat]
+        # [B, N, out_feat] @ [out_feat, heads] -> [B, N, heads]
+        e_left = torch.matmul(Wh, a_left)   
+        e_right = torch.matmul(Wh, a_right) 
+        
+        # Broadcasting to [B, heads, N, N]
+        # e_left: [B, N, heads] -> [B, heads, N, 1]
+        # e_right: [B, N, heads] -> [B, heads, 1, N]
+        e = e_left.permute(0, 2, 1).unsqueeze(3) + e_right.permute(0, 2, 1).unsqueeze(2)
+        e = self.leakyrelu(e) # [B, heads, N, N]
+        
+        # 3. Masking
+        if adj.dim() == 2:
+            adj_mask = adj.unsqueeze(0).unsqueeze(0).expand(B, self.heads, -1, -1)
+        else:
+            adj_mask = adj.unsqueeze(1) # Add heads dim
+            
+        mask = (adj_mask == 0)
+        e = e.masked_fill(mask, float('-inf'))
+        
+        # 4. Softmax & Attention Apply
+        attn_weights = torch.softmax(e, dim=-1) # Normalize over neighbors
+        attn_weights = torch.where(torch.isnan(attn_weights), torch.zeros_like(attn_weights), attn_weights)
+        
+        # Wh: [B, N, out_feat] -> [B, 1, N, out_feat] -> [B, heads, N, out_feat]
+        Wh_expanded = Wh.unsqueeze(1).expand(-1, self.heads, -1, -1)
+        
+        # [B, heads, N, N] @ [B, heads, N, out_feat] -> [B, heads, N, out_feat]
+        h_prime = torch.matmul(attn_weights, Wh_expanded)
+        
+        # 5. Merge heads (Average)
+        out = torch.mean(h_prime, dim=1) # [B, N, out_feat]
         out = torch.relu(out)
         
         return out if is_batched else out.squeeze(0)
-
-# Phase 3: Node2Vec Embedding (Simplified)
-class Node2VecEmbedding:
-    def __init__(self, num_nodes, embedding_dim=64):
-        self.embeddings = nn.Embedding(num_nodes, embedding_dim)
-    
-    def forward(self, node_indices):
-        return self.embeddings(node_indices)
 
 # Phase 3: Encoder-Decoder LSTM for multi-step forecasting
 class Encoder(nn.Module):

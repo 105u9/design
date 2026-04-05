@@ -214,28 +214,26 @@ def run_pipeline():
             real_predicted_rh = real_preds['indoor_humidity']
             real_predicted_temp = real_preds['indoor_temp']
             
-            # --- DYNAMIC BOUNDS OPTIMIZATION ---
-            # If current predicted temp < 18, assume winter/heating mode
+            # --- DYNAMIC BOUNDS OPTIMIZATION (2D: [Temp, WindSpeed]) ---
             if real_predicted_temp < 18:
-                search_bounds = [[20, 26]] # Heating range
+                search_bounds = [[20, 26], [0.1, 1.0]] # Heating range
             else:
-                search_bounds = [[18, 26]] # Cooling range
+                search_bounds = [[18, 26], [0.1, 1.0]] # Cooling range
             
         def hvac_fitness(x):
-            # x[0] is setpoint temperature
             setpoint = x[0]
-            # --- PHASE 5 UPGRADE: Consistent Physical Models ---
-            # 统一采用非线性公式: energy = load * (demand ** 1.2) / 10 + base_power
-            # If heating, demand is (setpoint - current), but we use max(0, 26 - setpoint) for cooling.
-            # For simplicity, we keep the cooling formula or adjust if heating.
-            # Actually, the user suggested: energy = load * (demand ** 1.2) / 10 + base_power
-            # We'll stick to the provided formula but use dynamic bounds.
-            cooling_demand = max(0, 26 - setpoint)
+            v_speed = x[1]
+            # --- PHASE 6 UPGRADE: Thermodynamics-based Energy Model ---
+            # Q_demand (cooling load proxy), assuming T_out = 35C and baseline T_set = 24C
+            q_demand = real_predicted_load * ((max(0, 35.0 - setpoint) / (35.0 - 24.0)) ** 1.2)
+            cop = 3.0 + 0.1 * (setpoint - 18)
+            p_fan = 10.0 * (v_speed ** 3)
             base_power = 20.0
-            energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + base_power
             
-            # Use consistent PMV parameters (icl=0.7, m=1.1, tr=ta+1.0)
-            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            energy = (q_demand / cop) + p_fan + base_power
+            
+            # Use dynamic wind speed in PMV
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=v_speed, m=1.1, icl=0.7)
             comfort_penalty = (pmv ** 2) * 50.0 
             
             return [energy, comfort_penalty]
@@ -243,18 +241,20 @@ def run_pipeline():
         mopso = MOPSO(hvac_fitness, search_bounds, num_particles=30, max_iter=20) 
         pareto = mopso.solve()
         
-        # --- PHASE 5: Consistent Pareto Selection ---
+        # --- PHASE 6: Consistent Pareto Selection ---
         acceptable_sols = []
         for p in pareto:
             sp = p['position'][0]
-            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            v_sp = p['position'][1]
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.5:
                 acceptable_sols.append(p)
         
         if not acceptable_sols:
             for p in pareto:
                 sp = p['position'][0]
-                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+                v_sp = p['position'][1]
+                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
                 if abs(pmv_val) <= 0.8:
                     acceptable_sols.append(p)
         
@@ -264,7 +264,7 @@ def run_pipeline():
             best_sol = min(pareto, key=lambda p: p['fitness'][1])
             
         print(f"MOPSO solved. Found {len(pareto)} Pareto-optimal control points.")
-        print(f"Sample recommendation (Best Acceptable Energy): {best_sol['position'][0]:.2f}C (PMV penalty: {best_sol['fitness'][1]:.2f})")
+        print(f"Sample recommendation (Best Acceptable Energy): {best_sol['position'][0]:.2f}C, {best_sol['position'][1]:.2f}m/s (PMV penalty: {best_sol['fitness'][1]:.2f})")
 
         # 4. CSV Backtest Simulation (Evaluation)
         print("\n[Step 4/4] Starting CSV-based Backtest Simulation (AI vs Baseline)...")

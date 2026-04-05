@@ -64,6 +64,7 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             setpoint REAL,
             chilled_water REAL,
+            wind_speed REAL,
             mode TEXT,
             status TEXT DEFAULT 'SENT'
         )
@@ -248,6 +249,7 @@ class SensorData(BaseModel):
 class ControlAction(BaseModel):
     chilled_water_temp: float = Field(..., description="推荐冷冻水出水温度 (℃)", example=7.0)
     supply_air_setpoint: float = Field(..., description="推荐室内空调设定值 (℃)", example=22.5)
+    wind_speed: float = Field(..., description="推荐送风风速 (m/s)", example=0.3)
     mode: str = Field(..., description="当前控制模式", example="AI_OPTIMIZED")
 
 class PredictionResponse(BaseModel):
@@ -301,7 +303,7 @@ initialize_demo_data()
 
 # Endpoints
 @app.post("/token", tags=["认证管理"], summary="获取访问令牌", description="使用管理员账号获取 OAuth2 访问令牌，默认账号：admin，默认密码：admin123")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT hashed_password FROM users WHERE username=?", (form_data.username,))
@@ -404,6 +406,34 @@ def collect_data(data: SensorData, current_user: dict = Depends(get_current_user
     logger.info(f"接收到传感器数据并持久化: {data}")
     return {"status": "success", "received_at": datetime.now().isoformat()}
 
+# Utility: Data Smoothing (EMA for Cold Start & Noise)
+def smooth_history_data(data_list, alpha=0.3):
+    """Apply Exponential Moving Average to smooth sensor data"""
+    if not data_list: return []
+    smoothed = []
+    
+    # Initialize with first value
+    prev_t = data_list[0].temperature
+    prev_h = data_list[0].humidity
+    prev_c = data_list[0].co2
+    prev_p = data_list[0].power
+    
+    for d in data_list:
+        curr_t = alpha * d.temperature + (1 - alpha) * prev_t
+        curr_h = alpha * d.humidity + (1 - alpha) * prev_h
+        curr_c = alpha * d.co2 + (1 - alpha) * prev_c
+        curr_p = alpha * d.power + (1 - alpha) * prev_p
+        
+        smoothed.append(SensorData(
+            timestamp=d.timestamp,
+            temperature=curr_t,
+            humidity=curr_h,
+            co2=curr_c,
+            power=curr_p
+        ))
+        prev_t, prev_h, prev_c, prev_p = curr_t, curr_h, curr_c, curr_p
+    return smoothed
+
 @app.post("/api/v1/predict", response_model=PredictionResponse, tags=["智能预测"], summary="多维负荷预测", description="""
 利用 **GAT-LSTM (图注意力网络+长短期记忆网络)** 模型预测未来 12 小时的多维环境指标。
 *   **GAT (Graph Attention Network)**：负责提取不同特征（如室外温度与能耗）之间的空间关联。
@@ -420,19 +450,17 @@ def predict_load(current_user: dict = Depends(get_current_user)):
     
     if model_instance and scaler:
         try:
-            # --- PHASE 5 UPGRADE: Rolling Forecast from Dynamic History ---
-            # Use real recent data from history_data if available, fallback to real_samples
+            # --- PHASE 6 UPGRADE: Smoothing and Forward-fill ---
             if len(history_data) >= 24:
-                # Get last 24 records from dynamic history
+                # Apply EMA to handle noise/cold-start
+                smoothed_history = smooth_history_data(history_data[-24:])
                 recent_data = []
                 f_names = metadata['feature_names'] if metadata else feature_names
-                for d in history_data[-24:]:
-                    # --- ROBUSTNESS FIX: Use last real sample as baseline (forward-fill) instead of 0.0 ---
+                for d in smoothed_history:
                     if real_samples:
                         entry = {col: real_samples[-1].get(col, 0.0) for col in f_names}
                     else:
                         entry = {col: 0.0 for col in f_names}
-                        # Physical defaults to avoid divergence
                         entry.update({'indoor_temp': 24.0, 'indoor_humidity': 50.0, 'indoor_co2': 600.0})
                     
                     entry['power_usage'] = d.power
@@ -442,7 +470,6 @@ def predict_load(current_user: dict = Depends(get_current_user)):
                     recent_data.append(entry)
                 recent_df = pd.DataFrame(recent_data)
             elif len(real_samples) >= 24:
-                # Fallback to static samples
                 recent_df = pd.DataFrame(real_samples[-24:])
             else:
                 raise ValueError("Not enough samples for prediction")
@@ -509,19 +536,20 @@ def predict_load(current_user: dict = Depends(get_current_user)):
 
 @app.post("/api/v1/optimize", response_model=ControlAction, tags=["优化控制"], summary="多目标决策优化", description="""
 基于当前的负荷预测结果，通过 **MOPSO (Multi-Objective Particle Swarm Optimization)** 算法动态计算最优设定值。
-*   **能耗目标**：降低空调能耗。
+*   **能耗目标**：降低空调能耗 (基于物理热力学公式 $E = Q/COP + P_{fan} + P_{base}$)。
 *   **舒适度目标**：基于 **PMV (预期平均热感觉)** 模型，使室内热环境达到最适宜状态。
-系统会从帕累托最优解集中选择一个兼顾两者的平衡方案。
+系统会从帕累托最优解集中选择一个兼顾两者的平衡方案，寻优维度包含温度与风速。
 """)
 @cached(optimize_cache, key=lambda current_user: "optimize_result")
 def optimize_control(current_user: dict = Depends(get_current_user)):
     """Solve for optimal control parameters using MOPSO (Optimization layer)"""
     # Functional Difference: Check AI Mode
     if not system_state["ai_mode"]:
-        logger.info("AI 模式已关闭，使用基准设定值 (24.0C)")
+        logger.info("AI 模式已关闭，使用基准设定值 (24.0C, 0.1m/s)")
         return ControlAction(
             chilled_water_temp=7.0,
             supply_air_setpoint=24.0, # Baseline fixed setpoint
+            wind_speed=0.1,
             mode="BASELINE_FIXED"
         )
 
@@ -532,17 +560,16 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
     
     if model_instance and scaler:
         try:
-            # --- ROBUSTNESS FIX: Use same rolling logic as predict_load ---
+            # --- PHASE 6 UPGRADE: EMA Smoothing for Robustness ---
             if len(history_data) >= 24:
+                smoothed_history = smooth_history_data(history_data[-24:])
                 recent_data = []
                 f_names = metadata['feature_names'] if metadata else feature_names
-                for d in history_data[-24:]:
-                    # --- ROBUSTNESS FIX: Use last real sample as baseline (forward-fill) instead of 0.0 ---
+                for d in smoothed_history:
                     if real_samples:
                         entry = {col: real_samples[-1].get(col, 0.0) for col in f_names}
                     else:
                         entry = {col: 0.0 for col in f_names}
-                        # Physical defaults to avoid divergence
                         entry.update({'indoor_temp': 24.0, 'indoor_humidity': 50.0, 'indoor_co2': 600.0})
 
                     entry['power_usage'] = d.power
@@ -579,94 +606,97 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
                     # Power
                     d_p = np.zeros((1, len(feature_list)))
                     p_idx = feature_list.index('power_usage')
-                    d_p[0, p_idx] = preds_scaled[0] # power_usage is at target index 0
+                    d_p[0, p_idx] = preds_scaled[0] 
                     real_predicted_load = scaler.inverse_transform(d_p)[0, p_idx]
                     
                     # Humidity
                     d_rh = np.zeros((1, len(feature_list)))
                     rh_idx = feature_list.index('indoor_humidity')
-                    d_rh[0, rh_idx] = preds_scaled[2] # indoor_humidity is at target index 2
+                    d_rh[0, rh_idx] = preds_scaled[2] 
                     real_predicted_rh = scaler.inverse_transform(d_rh)[0, rh_idx]
 
                     # Temperature (for dynamic bounds)
                     d_t = np.zeros((1, len(feature_list)))
                     t_idx = feature_list.index('indoor_temp')
-                    d_t[0, t_idx] = preds_scaled[1] # indoor_temp is at target index 1
+                    d_t[0, t_idx] = preds_scaled[1] 
                     real_predicted_temp = scaler.inverse_transform(d_t)[0, t_idx]
         except Exception as e:
             logger.error(f"Optimization prediction failed: {e}\n{traceback.format_exc()}")
-            real_predicted_temp = 22.0 # Default
+            real_predicted_temp = 22.0 
 
-    # --- DYNAMIC BOUNDS OPTIMIZATION ---
-    # If predicted temp < 18, assume winter/heating mode
+    # --- DYNAMIC BOUNDS OPTIMIZATION (2D: [Temp, WindSpeed]) ---
     if real_predicted_temp < 18:
-        search_bounds = [[20, 26]]
+        search_bounds = [[20, 26], [0.1, 1.0]] # Heating mode bounds
     else:
-        search_bounds = [[18, 26]]
+        search_bounds = [[18, 26], [0.1, 1.0]] # Cooling mode bounds
 
     def fitness_func(x):
         setpoint = x[0]
-        # --- PHASE 5 UPGRADE: Consistent Physical Models ---
-        # 统一采用非线性公式: energy = load * (demand ** 1.2) / 10 + base_power
-        cooling_demand = max(0, 26 - setpoint)
-        base_power = 20.0
-        energy = real_predicted_load * (cooling_demand ** 1.2) / 10.0 + base_power
+        v_speed = x[1]
         
-        # --- PMV Parameters Alignment (ISO 7730) ---
-        # Consistent parameters: icl=0.7 (clothing), m=1.1 (metabolic), tr=ta+1.0 (radiant)
-        pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+        # --- PHASE 6 UPGRADE: Thermodynamics-based Energy Model ---
+        # Q_demand (cooling load proxy): Assume T_out=35C, normalize to baseline 24C
+        q_demand = real_predicted_load * ((max(0, 35.0 - setpoint) / (35.0 - 24.0)) ** 1.2)
+        # COP model: Higher setpoint leads to higher efficiency in cooling
+        cop = 3.0 + 0.1 * (setpoint - 18)
+        # Fan Power model: Proportional to cube of wind speed
+        p_fan = 10.0 * (v_speed ** 3)
+        base_power = 20.0
+        
+        energy = (q_demand / cop) + p_fan + base_power
+        
+        # --- PMV Calculation with dynamic wind speed ---
+        pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=v_speed, m=1.1, icl=0.7)
         comfort_penalty = (pmv ** 2) * 50.0 
         return [energy, comfort_penalty]
 
     mopso = MOPSO(fitness_func, bounds=search_bounds, num_particles=30, max_iter=20)
     pareto_front = mopso.solve()
     
-    # --- PHASE 5: Consistent Pareto Selection ---
-    # 1. Filter solutions with acceptable PMV (target |PMV| <= 0.5)
+    # --- PHASE 6: Consistent Pareto Selection ---
     acceptable_sols = []
     for p in pareto_front:
         sp = p['position'][0]
-        pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+        v_sp = p['position'][1]
+        pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
         if abs(pmv_val) <= 0.5:
             acceptable_sols.append(p)
     
-    # 2. Relax if needed
     if not acceptable_sols:
         for p in pareto_front:
             sp = p['position'][0]
-            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=0.1, m=1.1, icl=0.7)
+            v_sp = p['position'][1]
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.8:
                 acceptable_sols.append(p)
                 
-    # 3. Select the best energy saving point from acceptable ones
     if acceptable_sols:
         best_sol = min(acceptable_sols, key=lambda p: p['fitness'][0])
     else:
-        # Fallback to the one with minimum comfort deviation if still none
         best_sol = min(pareto_front, key=lambda p: p['fitness'][1])
     
-    # --- CLOSED-LOOP CONTROL DOWNLINK (Simulation) ---
-    # In a real scenario, this would send Modbus/MQTT commands to the hardware PLC/DDC
+    # --- CLOSED-LOOP CONTROL DOWNLINK ---
     setpoint_val = float(best_sol['position'][0])
+    wind_speed_val = float(best_sol['position'][1])
     chilled_water_val = 7.0 + np.random.uniform(-0.5, 0.5)
     
-    # Persist the control action to the database logs
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO control_logs (timestamp, setpoint, chilled_water, mode)
-            VALUES (?, ?, ?, ?)
-        ''', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), setpoint_val, chilled_water_val, "AI_OPTIMIZED"))
+            INSERT INTO control_logs (timestamp, setpoint, chilled_water, wind_speed, mode)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), setpoint_val, chilled_water_val, wind_speed_val, "AI_OPTIMIZED"))
         conn.commit()
         conn.close()
-        logger.info(f"AI 控制指令已下发并记录: Setpoint={setpoint_val:.2f}C, ChilledWater={chilled_water_val:.2f}C")
+        logger.info(f"AI 控制指令已下发: Setpoint={setpoint_val:.2f}C, WindSpeed={wind_speed_val:.2f}m/s")
     except Exception as e:
         logger.error(f"Failed to log control action: {e}")
 
     return ControlAction(
         chilled_water_temp=chilled_water_val,
         supply_air_setpoint=setpoint_val,
+        wind_speed=wind_speed_val,
         mode="AI_OPTIMIZED"
     )
 
