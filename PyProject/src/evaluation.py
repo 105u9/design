@@ -26,9 +26,17 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
     device = next(model.parameters()).device
     model.eval()
     
+    # Optimization: Move evaluation datasets to GPU once
+    if device.type == 'cuda':
+        X_test = X_test.to(device)
+        y_test = y_test.to(device)
+        if adj is not None:
+            adj = adj.to(device)
+        print("Evaluation datasets moved to CUDA memory for backtest acceleration.")
+    
     # 0. Initial model error evaluation
     with torch.no_grad():
-        preds_scaled = model(X_test[:steps].to(device), adj=adj).cpu().numpy() # [steps, forecast_len, output_size]
+        preds_scaled = model(X_test[:steps], adj=adj).cpu().numpy() # [steps, forecast_len, output_size]
         y_true_scaled = y_test[:steps].cpu().numpy() # [steps, forecast_len, output_size]
         
         num_features = X_test.shape[2]
@@ -72,7 +80,7 @@ def run_backtest(model, X_test, y_test, scaler, target_cols, target_idxs, steps=
         # 1. AI Control Strategy
         # Predict load for current sequence
         with torch.no_grad():
-            current_X = X_test[i:i+1].to(device)
+            current_X = X_test[i:i+1] # Already on device if CUDA
             # Take the mean for the next horizon
             all_preds_scaled = model(current_X, adj=adj)[0].mean(dim=0).cpu().numpy()
             

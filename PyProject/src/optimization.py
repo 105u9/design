@@ -48,17 +48,43 @@ class Particle:
         self.best_fitness = [float('inf'), float('inf')] # [Energy, Discomfort]
 
 class MOPSO:
-    def __init__(self, fitness_func, bounds, num_particles=30, max_iter=50):
+    def __init__(self, fitness_func, bounds, num_particles=30, max_iter=50, max_archive_size=50):
         self.fitness_func = fitness_func
         self.bounds = np.array(bounds)
         self.num_particles = num_particles
         self.max_iter = max_iter
+        self.max_archive_size = max_archive_size
         self.particles = [Particle(bounds) for _ in range(num_particles)]
         self.archive = [] # Pareto front
+        
+        # Velocity clamping limit (e.g., 20% of range)
+        self.v_max = (self.bounds[:, 1] - self.bounds[:, 0]) * 0.2
         
     def is_dominated(self, fit1, fit2):
         # fit1 dominates fit2 if all objectives are better or equal and at least one is strictly better
         return all(f1 <= f2 for f1, f2 in zip(fit1, fit2)) and any(f1 < f2 for f1, f2 in zip(fit1, fit2))
+
+    def calculate_crowding_distance(self, archive):
+        if len(archive) <= 2:
+            for p in archive: p['crowding_distance'] = float('inf')
+            return archive
+        
+        num_objs = len(archive[0]['fitness'])
+        for p in archive: p['crowding_distance'] = 0
+        
+        for m in range(num_objs):
+            archive.sort(key=lambda x: x['fitness'][m])
+            archive[0]['crowding_distance'] = float('inf')
+            archive[-1]['crowding_distance'] = float('inf')
+            
+            f_min = archive[0]['fitness'][m]
+            f_max = archive[-1]['fitness'][m]
+            
+            if f_max == f_min: continue
+            
+            for i in range(1, len(archive) - 1):
+                archive[i]['crowding_distance'] += (archive[i+1]['fitness'][m] - archive[i-1]['fitness'][m]) / (f_max - f_min)
+        return archive
 
     def update_archive(self, particle):
         fitness = self.fitness_func(particle.position)
@@ -75,6 +101,13 @@ class MOPSO:
         
         if not is_p_dominated:
             new_archive.append({'position': np.copy(particle.position), 'fitness': fitness})
+            
+        # Pruning the archive based on Crowding Distance if it exceeds max size
+        if len(new_archive) > self.max_archive_size:
+            new_archive = self.calculate_crowding_distance(new_archive)
+            new_archive.sort(key=lambda x: x['crowding_distance'], reverse=True)
+            new_archive = new_archive[:self.max_archive_size]
+            
         self.archive = new_archive
 
     def solve(self):
@@ -86,11 +119,19 @@ class MOPSO:
                 
                 # Select a random leader from archive if available
                 if self.archive:
-                    leader = self.archive[np.random.randint(len(self.archive))]['position']
+                    # Probabilistically select from the top 10% least crowded particles
+                    self.calculate_crowding_distance(self.archive)
+                    self.archive.sort(key=lambda x: x['crowding_distance'], reverse=True)
+                    top_n = max(1, int(len(self.archive) * 0.1))
+                    leader = self.archive[np.random.randint(top_n)]['position']
                 else:
                     leader = p.best_position
                     
-                p.velocity = w * p.velocity + c1 * r1 * (p.best_position - p.position) + c2 * r2 * (leader - p.position)
+                # Update velocity with clamping
+                new_v = w * p.velocity + c1 * r1 * (p.best_position - p.position) + c2 * r2 * (leader - p.position)
+                p.velocity = np.clip(new_v, -self.v_max, self.v_max)
+                
+                # Update position
                 p.position = np.clip(p.position + p.velocity, self.bounds[:, 0], self.bounds[:, 1])
                 
                 # Update best position

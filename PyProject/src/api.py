@@ -12,6 +12,26 @@ import pandas as pd
 import time
 import logging
 from datetime import datetime, timedelta
+import jwt
+from passlib.context import CryptContext
+
+# --- JWT Configuration (Security Optimization) ---
+SECRET_KEY = "your-secret-key-for-graduation-project" # Change this in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 120 # 2 hours as suggested
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 # --- API Tags Metadata for better documentation ---
 tags_metadata = [
@@ -71,12 +91,16 @@ app = FastAPI(
 # Load global scaler and model
 scaler = None
 adj_matrix = None
+metadata = None
 if os.path.exists("src/data_scaler.pkl"):
     scaler = joblib.load("src/data_scaler.pkl")
     logger.info("Loaded scaler from src/data_scaler.pkl")
 if os.path.exists("src/adj_matrix.pkl"):
     adj_matrix = joblib.load("src/adj_matrix.pkl")
     logger.info("Loaded adjacency matrix from src/adj_matrix.pkl")
+if os.path.exists("src/metadata.pkl"):
+    metadata = joblib.load("src/metadata.pkl")
+    logger.info("Loaded metadata from src/metadata.pkl")
 
 # Device Detection
 cuda_available = torch.cuda.is_available()
@@ -86,6 +110,8 @@ if not cuda_available:
     logger.warning("NVIDIA GPU not detected by PyTorch. Using CPU for API inference. If you have a GPU, please install the CUDA-enabled version of PyTorch.")
 else:
     logger.info(f"API CUDA Enabled: {torch.cuda.get_device_name(0)}")
+    # Optimization for repeated fixed-size inputs
+    torch.backends.cudnn.benchmark = True
 
 # Load real data for demo and to determine model input size
 try:
@@ -93,13 +119,22 @@ try:
     df_raw = load_building_data("Panther_office_Karla", "Panther")
     df_real = clean_and_impute(df_raw, method='mean')
     real_samples = df_real.to_dict('records')
-    # Dynamically determine the number of numeric features
-    dynamic_input_size = df_real.select_dtypes(include=[np.number]).shape[1]
-    logger.info(f"Determined dynamic input size: {dynamic_input_size}")
+    
+    # --- Robustness Fix: Use metadata for input size if available ---
+    if metadata:
+        dynamic_input_size = metadata['input_size']
+        feature_names = metadata['feature_names']
+        logger.info(f"Using metadata input size: {dynamic_input_size}")
+    else:
+        # Dynamically determine the number of numeric features
+        dynamic_input_size = df_real.select_dtypes(include=[np.number]).shape[1]
+        feature_names = df_real.select_dtypes(include=[np.number]).columns.tolist()
+        logger.info(f"Determined dynamic input size: {dynamic_input_size}")
 except Exception as e:
     logger.warning(f"Could not load real samples for dynamic sizing: {e}")
     real_samples = []
     dynamic_input_size = 8 # Fallback
+    feature_names = []
 
 model_instance = None
 try:
@@ -118,13 +153,21 @@ try:
 except Exception as e:
     logger.warning(f"Could not load LSTM model: {e}")
 
-# Authentication logic (Simulated for Phase 5)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
+# Authentication logic (Security Optimization with JWT)
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    if token != "fake-super-secret-token":
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
-    return {"username": "admin"}
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+    return {"username": username}
 
 # Data Models
 class SensorData(BaseModel):
@@ -187,7 +230,11 @@ initialize_demo_data()
 @app.post("/token", tags=["认证管理"], summary="获取访问令牌", description="使用管理员账号获取 OAuth2 访问令牌，默认账号：admin，默认密码：admin123")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     if form_data.username == "admin" and form_data.password == "admin123":
-        return {"access_token": "fake-super-secret-token", "token_type": "bearer"}
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": form_data.username}, expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
     raise HTTPException(status_code=400, detail="用户名或密码不正确")
 
 @app.get("/", tags=["系统配置"], summary="根路径重定向", description="自动重定向到可视化监控大屏页面，方便用户快速查看系统状态")
@@ -253,14 +300,21 @@ def predict_load(current_user: dict = Depends(get_current_user)):
     forecast_horizon = [(now + timedelta(hours=i)).strftime("%H:00") for i in range(1, 13)]
     
     # Requirement: Predict multi-dimensional (Power, Temp, Humidity, CO2)
-    target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
+    target_cols = metadata['target_cols'] if metadata else ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
     
     if model_instance and scaler:
         try:
             # Use real recent data from BDG2 if available
             if len(real_samples) >= 24:
-                # Get last 24 records, filter numeric features
-                recent_df = pd.DataFrame(real_samples[-24:]).select_dtypes(include=[np.number])
+                # Get last 24 records
+                recent_df = pd.DataFrame(real_samples[-24:])
+                
+                # --- ROBUSTNESS FIX: Ensure column order matches training ---
+                if metadata and 'feature_names' in metadata:
+                    # Filter and reorder columns according to metadata
+                    recent_df = recent_df[metadata['feature_names']]
+                else:
+                    recent_df = recent_df.select_dtypes(include=[np.number])
                 
                 # IMPORTANT: Normalize input using the trained scaler
                 recent_data_scaled = scaler.transform(recent_df)
@@ -274,11 +328,13 @@ def predict_load(current_user: dict = Depends(get_current_user)):
                 
                 # Get raw predicted values for each dimension
                 predictions = {}
+                feature_list = metadata['feature_names'] if metadata else recent_df.columns.tolist()
+                
                 for i, col in enumerate(target_cols):
                     scaled_pred = pred[0, :, i].detach().cpu().numpy()
                     # Inverse transform
-                    dummy_pred = np.zeros((12, recent_df.shape[1]))
-                    target_idx = recent_df.columns.get_loc(col)
+                    dummy_pred = np.zeros((12, len(feature_list)))
+                    target_idx = feature_list.index(col)
                     dummy_pred[:, target_idx] = scaled_pred
                     real_pred = scaler.inverse_transform(dummy_pred)[:, target_idx]
                     # Add a small amount of dynamic noise to make it feel "live"
@@ -336,7 +392,15 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
     
     if model_instance and scaler and len(real_samples) >= 24:
         try:
-            recent_df = pd.DataFrame(real_samples[-24:]).select_dtypes(include=[np.number])
+            recent_df = pd.DataFrame(real_samples[-24:])
+            # --- ROBUSTNESS FIX: Ensure column order matches training ---
+            if metadata and 'feature_names' in metadata:
+                feature_list = metadata['feature_names']
+                recent_df = recent_df[feature_list]
+            else:
+                recent_df = recent_df.select_dtypes(include=[np.number])
+                feature_list = recent_df.columns.tolist()
+
             recent_data_scaled = scaler.transform(recent_df)
             input_tensor = torch.FloatTensor(recent_data_scaled).unsqueeze(0).to(device)
             adj_tensor = torch.FloatTensor(adj_matrix).to(device) if adj_matrix is not None else None
@@ -344,17 +408,17 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
             with torch.no_grad():
                 preds_scaled = model_instance(input_tensor, adj=adj_tensor)[0].mean(dim=0).cpu().numpy()
                 
-                # De-normalize load and humidity
+                # De-normalize load and humidity using metadata order
                 # Power
-                d_p = np.zeros((1, recent_df.shape[1]))
-                p_idx = recent_df.columns.get_loc('power_usage')
-                d_p[0, p_idx] = preds_scaled[0] # power_usage is at index 0
+                d_p = np.zeros((1, len(feature_list)))
+                p_idx = feature_list.index('power_usage')
+                d_p[0, p_idx] = preds_scaled[0] # power_usage is at target index 0
                 real_predicted_load = scaler.inverse_transform(d_p)[0, p_idx]
                 
                 # Humidity
-                d_rh = np.zeros((1, recent_df.shape[1]))
-                rh_idx = recent_df.columns.get_loc('indoor_humidity')
-                d_rh[0, rh_idx] = preds_scaled[2] # indoor_humidity is at index 2
+                d_rh = np.zeros((1, len(feature_list)))
+                rh_idx = feature_list.index('indoor_humidity')
+                d_rh[0, rh_idx] = preds_scaled[2] # indoor_humidity is at target index 2
                 real_predicted_rh = scaler.inverse_transform(d_rh)[0, rh_idx]
         except Exception as e:
             logger.warning(f"Optimization prediction failed, using defaults: {e}")

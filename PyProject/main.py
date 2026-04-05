@@ -43,6 +43,8 @@ def run_pipeline():
         print("Note: NVIDIA GPU not detected. Using CPU. To enable CUDA, ensure NVIDIA drivers and the correct PyTorch version are installed.")
     else:
         print(f"CUDA Enabled: {torch.cuda.get_device_name(0)}")
+        # Performance optimization for fixed-size inputs
+        torch.backends.cudnn.benchmark = True
     
     # 1. Data Preprocessing (Phase 2)
     print("\n[Step 1/4] Preprocessing building data (Building Genome Project 2)...")
@@ -53,49 +55,83 @@ def run_pipeline():
         df_raw = load_building_data(building_id, site_id)
         df_cleaned = clean_and_impute(df_raw, method='mean')
         
-        # --- NEW: Generate real adjacency matrix from PCC ---
-        print("Generating Graph topology from Pearson Correlation Coefficients...")
-        adj_matrix, feature_names = generate_pcc_adj(df_cleaned, threshold=0.5)
+        # --- FIX: Split before normalization to avoid Data Leakage ---
+        train_size = int(len(df_cleaned) * 0.8)
+        df_train = df_cleaned.iloc[:train_size]
+        df_test = df_cleaned.iloc[train_size:]
+        
+        # Fit scaler only on training data
+        numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        scaler.fit(df_train[numeric_cols])
+        
+        # Transform both train and test
+        df_train_norm = df_train.copy()
+        df_train_norm[numeric_cols] = scaler.transform(df_train[numeric_cols])
+        df_test_norm = df_test.copy()
+        df_test_norm[numeric_cols] = scaler.transform(df_test[numeric_cols])
+        
+        # Save metadata (feature order) for API robustness
+        metadata = {
+            'feature_names': numeric_cols.tolist(),
+            'target_cols': ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2'],
+            'input_size': len(numeric_cols)
+        }
+        joblib.dump(metadata, "src/metadata.pkl")
+        print(f"Metadata saved with {len(numeric_cols)} features.")
+
+        # --- NEW: Generate real adjacency matrix from PCC (on train data only) ---
+        print("Generating Graph topology from Pearson Correlation Coefficients (Train set)...")
+        adj_matrix, feature_names = generate_pcc_adj(df_train, threshold=0.5)
         adj_tensor = torch.FloatTensor(adj_matrix).to(device)
         joblib.dump(adj_matrix, "src/adj_matrix.pkl")
         
-        df_normalized, scaler = normalize_data(df_cleaned)
         print(f"Data loading complete for building: {building_id}")
         
         # 2. Algorithm & Model (Phase 3)
-        # Requirement: Predict multi-dimensional environmental parameters
-        target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
+        target_cols = metadata['target_cols']
         print(f"\n[Step 2/4] Training LSTM Prediction Model (Encoder-Decoder) with GAT for: {target_cols}")
-        X, y = prepare_sequences(df_normalized, target_cols=target_cols)
+        X_train, y_train = prepare_sequences(df_train_norm, target_cols=target_cols)
+        X_test, y_test = prepare_sequences(df_test_norm, target_cols=target_cols)
         
-        # Split into train/test (80/20)
-        train_size = int(len(X) * 0.8)
-        X_train, X_test = X[:train_size], X[train_size:]
-        y_train, y_test = y[:train_size], y[train_size:]
+        # Optimization: Move datasets to GPU if memory allows (14k samples is small)
+        if cuda_available:
+            X_train, y_train = X_train.to(device), y_train.to(device)
+            X_test, y_test = X_test.to(device), y_test.to(device)
+            print("Training and test datasets moved to CUDA memory for maximum speed.")
         
-        input_size = X.shape[2]
+        input_size = X_train.shape[2]
         hidden_size = 64
-        output_size = len(target_cols) # predicting multi-dimensional
+        output_size = len(target_cols)
         forecast_len = 12
         
         model = LSTM_ED_Model(input_size, hidden_size, output_size, forecast_len).to(device)
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         
-        # Full training on all available data
-        epochs = 10 # Increased for real data
+        # Enhanced Training Loop: Teacher Forcing, Validation, Early Stopping
+        epochs = 20 
         batch_size = 64
-        print(f"Starting full training for {epochs} epochs on {len(X_train)} samples...")
+        best_val_loss = float('inf')
+        patience = 5
+        trigger_times = 0
+        teacher_forcing_ratio = 0.5 # Initial ratio
+        
+        print(f"Starting enhanced training for {epochs} epochs on {len(X_train)} samples...")
         
         for epoch in range(epochs):
             model.train()
             epoch_loss = 0
+            # Decay teacher forcing ratio
+            tf_ratio = teacher_forcing_ratio * (0.9 ** epoch)
+            
             for i in range(0, len(X_train), batch_size):
-                batch_X = X_train[i:i+batch_size].to(device)
-                batch_y = y_train[i:i+batch_size].to(device)
+                batch_X = X_train[i:i+batch_size]
+                batch_y = y_train[i:i+batch_size]
                 
                 optimizer.zero_grad()
-                out = model(batch_X, adj=adj_tensor) # PASS REAL ADJ MATRIX
+                out = model(batch_X, adj=adj_tensor, y=batch_y, teacher_forcing_ratio=tf_ratio)
                 loss = criterion(out, batch_y)
                 loss.backward()
                 optimizer.step()
@@ -104,36 +140,47 @@ def run_pipeline():
             # Validation
             model.eval()
             with torch.no_grad():
-                test_out = model(X_test[:100].to(device), adj=adj_tensor) # PASS REAL ADJ MATRIX
-                test_loss = criterion(test_out, y_test[:100].to(device))
-                
-            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss/(len(X_train)/batch_size):.6f}, Val Loss: {test_loss.item():.6f}")
+                val_out = model(X_test, adj=adj_tensor) 
+                val_loss = criterion(val_out, y_test)
             
-        torch.save(model.state_dict(), "src/lstm_model.pth")
+            avg_train_loss = epoch_loss / (len(X_train)/batch_size)
+            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss.item():.6f}, TF Ratio: {tf_ratio:.2f}")
+            
+            # Save Best Model & Early Stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), "src/lstm_model.pth")
+                trigger_times = 0
+                print(f"  --> Best model saved at epoch {epoch+1}")
+            else:
+                trigger_times += 1
+                if trigger_times >= patience:
+                    print(f"Early stopping at epoch {epoch+1}!")
+                    break
+            
         joblib.dump(scaler, "src/data_scaler.pkl")
-        print("Model, scaler and adj_matrix saved to src/.")
+        print("Final scaler saved to src/data_scaler.pkl")
 
         # 3. Optimization Strategy (Phase 4)
         print("\n[Step 3/4] Running MOPSO optimization (Energy vs Comfort/PMV)...")
-        # Use the trained model to predict future load for a given setpoint
         model.eval()
         with torch.no_grad():
-            # Get real recent data for prediction
-            last_seq = X[-1:].to(device)
+            # Get real recent data for prediction from the end of test set
+            last_seq = X_test[-1:].to(device)
             # Predict for all channels
             preds_scaled = model(last_seq, adj=adj_tensor)[0] # [12, 4]
             
             # Mean predicted values for the next 12 hours
             avg_preds_scaled = preds_scaled.mean(dim=0).cpu().numpy() # [4]
             
-            # De-normalize predicted values properly using scaler
-            dummy_pred = np.zeros((1, X.shape[2]))
-            target_idxs = [df_normalized.select_dtypes(include=[np.number]).columns.get_loc(col) for col in target_cols]
+            # De-normalize predicted values properly using scaler and metadata
+            feature_names = metadata['feature_names']
+            target_idxs = [feature_names.index(col) for col in target_cols]
             
             # De-normalize each target
             real_preds = {}
             for i, col in enumerate(target_cols):
-                d_p = np.zeros((1, X.shape[2]))
+                d_p = np.zeros((1, len(feature_names)))
                 d_p[0, target_idxs[i]] = avg_preds_scaled[i]
                 real_preds[col] = scaler.inverse_transform(d_p)[0, target_idxs[i]]
             
@@ -200,10 +247,10 @@ def start_mqtt():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HVAC Intelligent Control System - Main Program")
-    parser.add_argument("--run", action="store_true", help="运行训练与回测全流程 (Run full pipeline)")
-    parser.add_argument("--api", action="store_true", help="启动 FastAPI 后端服务 (Start backend API)")
-    parser.add_argument("--mqtt", action="store_true", help="启动 MQTT IoT 模拟发布 (Start MQTT IoT Simulation)")
-    parser.add_argument("--trnsys", action="store_true", help="启动 TRNSYS 联合仿真接口 (Start TRNSYS Bridge)")
+    parser.add_argument("--run", action="store_true", help="Run full pipeline")
+    parser.add_argument("--api", action="store_true", help="Start backend API")
+    parser.add_argument("--mqtt", action="store_true", help="Start MQTT IoT Simulation")
+    parser.add_argument("--trnsys", action="store_true", help="Start TRNSYS Bridge")
     
     args = parser.parse_args()
     
@@ -216,10 +263,10 @@ if __name__ == "__main__":
     elif args.trnsys:
         start_trnsys()
     else:
-        print("请使用以下参数运行程序 (Please use arguments):")
-        print("  python main.py --run      # 运行训练与优化回测流程")
-        print("  python main.py --api      # 启动监控后端与可视化大屏")
-        print("  python main.py --mqtt     # 启动工业物联网 (MQTT) 模拟数据流")
-        print("  python main.py --trnsys   # 启动 TRNSYS 动态闭环仿真接口")
+        print("Usage:")
+        print("  python main.py --run      # Run training and backtest")
+        print("  python main.py --api      # Start backend and dashboard")
+        print("  python main.py --mqtt     # Start MQTT IoT simulation")
+        print("  python main.py --trnsys   # Start TRNSYS bridge")
         # Default to run pipeline if no args provided to avoid confusion
         run_pipeline()

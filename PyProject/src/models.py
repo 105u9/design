@@ -51,13 +51,20 @@ class GATLayer(nn.Module):
         
         e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(3)) # [B, N, N]
 
-        zero_vec = -9e15 * torch.ones_like(e)
+        # Improved Masking for Numerical Stability
         # adj should be [N, N] or [B, N, N]
         if adj.dim() == 2:
             adj = adj.unsqueeze(0).expand(B, -1, -1)
             
-        attention = torch.where(adj > 0, e, zero_vec)
+        # Masking: Use a very large negative value for non-edges before Softmax
+        mask = (adj == 0)
+        attention = e.masked_fill(mask, float('-inf'))
         attention = torch.softmax(attention, dim=2)
+        
+        # Handle cases where a node has no neighbors (all -inf in a row)
+        # Softmax of all -inf is NaN, so we replace NaNs with 0
+        attention = torch.where(torch.isnan(attention), torch.zeros_like(attention), attention)
+        
         h_prime = torch.matmul(attention, Wh) # [B, N, out_feat]
 
         out = torch.relu(h_prime)
@@ -110,8 +117,9 @@ class LSTM_ED_Model(nn.Module):
         self.hidden_size = hidden_size
         self.output_size = output_size
         
-    def forward(self, x, adj=None):
+    def forward(self, x, adj=None, y=None, teacher_forcing_ratio=0.0):
         # x: [batch_size, seq_len, input_size]
+        # y: [batch_size, forecast_len, output_size] (Optional, used for Teacher Forcing)
         batch_size, seq_len, input_size = x.size()
         
         if adj is None:
@@ -138,15 +146,20 @@ class LSTM_ED_Model(nn.Module):
         _, (h, c) = self.encoder(x_gnn)
         h, c = h[0], c[0] # [batch_size, hidden_size]
         
-        # Initial decoder input
-        decoder_input = torch.zeros(batch_size, self.output_size).to(x.device)
+        # Initial decoder input (using zero initialization on the same device)
+        decoder_input = torch.zeros(batch_size, self.output_size, device=x.device)
         
         outputs = []
-        for _ in range(self.forecast_len):
+        for i in range(self.forecast_len):
             h, c = self.decoder_cell(decoder_input, (h, c))
             prediction = self.fc(h) 
             outputs.append(prediction.unsqueeze(1))
-            decoder_input = prediction # Auto-regressive
+            
+            # Teacher Forcing: With probability p, use the real label y as the next input
+            if y is not None and np.random.random() < teacher_forcing_ratio:
+                decoder_input = y[:, i, :]
+            else:
+                decoder_input = prediction # Auto-regressive
             
         return torch.cat(outputs, dim=1)
 
