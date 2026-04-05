@@ -77,6 +77,12 @@ def init_db():
         cursor.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, ?)", 
                        ("admin", hashed_pwd, "admin"))
     
+    # DB robustness migration for legacy tables
+    try:
+        cursor.execute("ALTER TABLE control_logs ADD COLUMN wind_speed REAL")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+    
     conn.commit()
     conn.close()
 
@@ -130,22 +136,30 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="HVAC 智能控制系统 API",
+    title="数据驱动的暖通空调智能控制原型系统 API",
+    docs_url=None, # Disable default so we can override it with custom CSS
     description="""
-## 项目背景
-本项目是一个基于数据驱动的空调智能控制系统原型。它通过集成深度学习预测与多目标优化算法，旨在实现建筑节能与室内舒适度的双重目标。
+### 项目背景
+本项目是一个基于数据驱动的空调智能控制系统 API 后端。系统通过集成深度学习（GAT-LSTM）负荷预测与多目标粒子群（MOPSO）优化算法，旨在实现建筑节能与室内热舒适度的双重目标优化。
 
-## 核心功能说明
-*   **多维感知**：支持温度、湿度、CO2、能耗等多种环境参数的实时采集。
-*   **精准预测**：采用 Encoder-Decoder LSTM 架构，结合图卷积捕捉特征相关性。
-*   **智能决策**：通过 MOPSO 算法动态调整空调设定值，比传统固定设定值更智能、更节能。
+> [!IMPORTANT]
+> **数据源声明**：本系统的环境监测数据基座并非来自于真实的底层物理传感器采集，而是完全基于大型开源建筑能耗数据集 **Building Data Genome Project 2 (BDG2)** 的历史轨迹。系统通过映射和重采样历史数据轴，构建虚拟的数字孪生测试床。
 
-## 快速上手
-1.  在 **认证管理** 标签下使用默认账号 `admin/admin123` 获取 Token。
-2.  在右上角 `Authorize` 按钮处填入 Token 即可解锁受保护的接口。
+### 接口与鉴权规范
+* **安全鉴权**：系统所有核心业务接口均采取了严格的 `OAuth2 Password Bearer` 令牌保护机制。请在 **认证管理** 模块获取有效 Token，点击页面右上角的 `Authorize` 进行应用授权。
+* **数据格式**：所有请求与响应体均严格遵循 JSON 结构规范，响应数据由 Pydantic 层完成类型与范围校验。
+
+### API 功能模块表
+1. **认证鉴权**：OAuth2 Token 颁发，防暴力破解机制。
+2. **多维环境感知**：接收及发布温湿度、CO2、能耗的实时时间序列流。
+3. **负荷预测**：执行深度学习推断，提取时间序列的演化规律。
+4. **决策寻优**：基于当前负荷预测，动态计算符合帕累托最优的空调控制指令。
 """,
     version="2.0.0",
-    openapi_tags=tags_metadata
+    openapi_tags=tags_metadata,
+    contact={
+        "name": "Graduation Project Developer",
+    }
 )
 
 # --- CORS Configuration (Cross-Origin Optimization) ---
@@ -259,6 +273,36 @@ class PredictionResponse(BaseModel):
     predicted_humidity: List[float] = Field(..., description="未来 12 小时湿度预测值 (%)", example=[45.0, 45.5, 46.0])
     predicted_co2: List[float] = Field(..., description="未来 12 小时 CO2 浓度预测值 (ppm)", example=[650, 660, 675])
 
+class SystemState(BaseModel):
+    ai_mode: bool = Field(..., description="当前 AI 优化模式状态", example=True)
+    last_update: str = Field(..., description="最后状态更新时间", example="2026-04-05T12:00:00")
+
+class MonitoringResponse(BaseModel):
+    history: List[SensorData] = Field(..., description="最近24小时的环境监测序列数据")
+    system: SystemState = Field(..., description="系统当前全局控制状态")
+
+class ToggleResponse(BaseModel):
+    status: str = Field(..., description="请求执行结果", example="success")
+    ai_mode: bool = Field(..., description="切换后的 AI 模式状态", example=True)
+
+class CollectResponse(BaseModel):
+    status: str = Field(..., description="请求执行结果", example="success")
+    received_at: str = Field(..., description="服务器确认接收时间", example="2026-04-05T12:00:01")
+
+# CRUD Models for Users
+class UserCreate(BaseModel):
+    username: str = Field(..., description="新建用户名", example="testuser")
+    password: str = Field(..., description="新建用户密码", example="password123")
+    role: str = Field(default="operator", description="系统角色分配 (admin 或 operator)", example="operator")
+
+class UserUpdate(BaseModel):
+    role: str = Field(..., description="更新后的系统角色", example="admin")
+
+class UserResponse(BaseModel):
+    id: int = Field(..., description="用户唯一流水 ID")
+    username: str = Field(..., description="用户名")
+    role: str = Field(..., description="当前角色")
+
 # In-memory time-series store (Simulating InfluxDB)
 history_data: List[SensorData] = []
 MAX_HISTORY = 100
@@ -318,15 +362,26 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         return {"access_token": access_token, "token_type": "bearer"}
     raise HTTPException(status_code=400, detail="用户名或密码不正确")
 
+from fastapi.openapi.docs import get_swagger_ui_html
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - API 文档",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_css_url="/static/swagger-dark.css"
+    )
+
 @app.get("/", tags=["系统配置"], summary="根路径重定向", description="自动重定向到可视化监控大屏页面，方便用户快速查看系统状态")
 def read_root():
     """Redirect to the visual dashboard"""
     return RedirectResponse(url="/static/index.html")
 
-@app.get("/api/v1/monitoring", tags=["环境感知"], summary="获取监测数据", description="""
-获取最近 24 小时的实时环境监测数据。
+@app.get("/api/v1/monitoring", response_model=MonitoringResponse, tags=["环境感知"], summary="获取监测数据", responses={401: {"description": "需要身份验证"}}, description="""
+获取最近 24 小时的实时环境监测数据序列。
 包含：温度 (℃)、湿度 (%)、CO2 (ppm) 和能耗 (kW)。
-本接口会自动模拟实时数据更新，确保监控大屏保持动态。
+本接口将自动结合历史数据表，提供完整的态势感知视图。
 """)
 def get_monitoring(current_user: dict = Depends(get_current_user)):
     """Get the latest 24 hours of monitoring data and system state"""
@@ -377,7 +432,7 @@ def get_monitoring(current_user: dict = Depends(get_current_user)):
         "system": system_state
     }
 
-@app.post("/api/v1/toggle_ai", tags=["系统配置"], summary="切换 AI 模式", description="开启或关闭基于 MOPSO 的 AI 自动优化控制模式。开启后系统将动态计算最优设定值，关闭后恢复基准 24.0℃ 控制。")
+@app.post("/api/v1/toggle_ai", response_model=ToggleResponse, tags=["系统配置"], summary="切换 AI 模式", responses={401: {"description": "需要身份验证"}}, description="开启或关闭基于 MOPSO 的 AI 自动优化控制模式。开启后系统将动态计算最优设定值，关闭后恢复基准控制模式。")
 def toggle_ai(mode: bool, current_user: dict = Depends(get_current_user)):
     """Toggle AI control mode on/off"""
     system_state["ai_mode"] = mode
@@ -385,7 +440,7 @@ def toggle_ai(mode: bool, current_user: dict = Depends(get_current_user)):
     logger.info(f"AI 模式已切换为: {mode}")
     return {"status": "success", "ai_mode": mode}
 
-@app.post("/api/v1/collect", tags=["环境感知"], summary="接收传感器数据", description="模拟工业物联网 (IoT) 设备的实时采集数据上报接口。")
+@app.post("/api/v1/collect", response_model=CollectResponse, tags=["环境感知"], summary="终端传感器数据上报", responses={401: {"description": "需要身份验证"}, 422: {"description": "数据格式校验失败"}}, description="用于工业物联网终端设备异步上传实时的环境监测数据包至服务器保存。")
 def collect_data(data: SensorData, current_user: dict = Depends(get_current_user)):
     """Receive real-time data from sensors (Perception -> Platform)"""
     # Memory update
@@ -434,10 +489,69 @@ def smooth_history_data(data_list, alpha=0.3):
         prev_t, prev_h, prev_c, prev_p = curr_t, curr_h, curr_c, curr_p
     return smoothed
 
-@app.post("/api/v1/predict", response_model=PredictionResponse, tags=["智能预测"], summary="多维负荷预测", description="""
-利用 **GAT-LSTM (图注意力网络+长短期记忆网络)** 模型预测未来 12 小时的多维环境指标。
-*   **GAT (Graph Attention Network)**：负责提取不同特征（如室外温度与能耗）之间的空间关联。
-*   **LSTM (Long Short-Term Memory)**：负责提取时间序列的演化规律。
+# --- USER CRUD Endpoints ---
+@app.post("/api/v1/users", response_model=UserResponse, tags=["用户管理"], summary="创建新用户 (C)", responses={401: {"description": "需要身份验证"}, 400: {"description": "用户已存在"}}, description="新建一个操作员或管理员账户，密码将使用 hash 进行安全存储。")
+def create_user(user: UserCreate, current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE username=?", (user.username,))
+    if cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="用户名已存在")
+    
+    hashed_pwd = pwd_context.hash(user.password)
+    cursor.execute("INSERT INTO users (username, hashed_password, role) VALUES (?, ?, ?)", 
+                   (user.username, hashed_pwd, user.role))
+    user_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return UserResponse(id=user_id, username=user.username, role=user.role)
+
+@app.get("/api/v1/users", response_model=List[UserResponse], tags=["用户管理"], summary="获取用户列表 (R)", responses={401: {"description": "需要身份验证"}}, description="查询系统中注册的所有用户名单。")
+def get_users(current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, username, role FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    return [UserResponse(id=r[0], username=r[1], role=r[2]) for r in rows]
+
+@app.put("/api/v1/users/{user_id}", response_model=UserResponse, tags=["用户管理"], summary="更新用户信息 (U)", responses={401: {"description": "需要身份验证"}, 404: {"description": "用户不存在"}}, description="根据 User ID 修改指定用户的访问角色。")
+def update_user(user_id: int, user_update: UserUpdate, current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM users WHERE id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="未找到对应的用户")
+    
+    cursor.execute("UPDATE users SET role=? WHERE id=?", (user_update.role, user_id))
+    conn.commit()
+    conn.close()
+    return UserResponse(id=user_id, username=row[0], role=user_update.role)
+
+@app.delete("/api/v1/users/{user_id}", tags=["用户管理"], summary="删除系统用户 (D)", responses={401: {"description": "需要身份验证"}, 404: {"description": "用户不存在"}, 403: {"description": "越权操作禁止"}}, description="根据 User ID 删除注销系统里的账户（限制不能删除超级管理员）。")
+def delete_user(user_id: int, current_user: dict = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM users WHERE id=?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="未找到对应的用户")
+    
+    if row[0] == "admin":
+        conn.close()
+        raise HTTPException(status_code=403, detail="系统初始化超级管理员不可删除")
+        
+    cursor.execute("DELETE FROM users WHERE id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "message": f"用户 {row[0]} 已注销"}
+
+@app.post("/api/v1/predict", response_model=PredictionResponse, tags=["智能预测"], summary="多维系统负荷预测", responses={401: {"description": "需要身份验证"}}, description="""
+利用 **GAT-LSTM (图注意力网络+长短期记忆网络)** 模型对包含环境、负荷等节点特征变量的图结构进行未来十二个小时序列预测。
 """)
 @cached(predict_cache, key=lambda current_user: "predict_result")
 def predict_load(current_user: dict = Depends(get_current_user)):
