@@ -8,7 +8,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 def load_data(file_path):
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(file_path, engine='python', on_bad_lines='skip')
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df = df.sort_values('timestamp')
     return df
@@ -80,19 +80,19 @@ def load_building_data(building_id, site_id, meter_type='chilledwater'):
     
     # Load Weather Data (All Features)
     weather_path = os.path.join(base_path, "building-data-genome-project-2", "data", "weather", "weather.csv")
-    df_weather = pd.read_csv(weather_path)
+    df_weather = pd.read_csv(weather_path, engine='python', on_bad_lines='skip')
     df_weather['timestamp'] = pd.to_datetime(df_weather['timestamp'])
     df_weather = df_weather[df_weather['site_id'] == site_id]
     
     # Load Primary Meter Data (e.g., Chilled Water for Cooling Load)
     meter_path = os.path.join(base_path, "building-data-genome-project-2", "data", "meters", "cleaned", f"{meter_type}_cleaned.csv")
-    df_meter = pd.read_csv(meter_path)
+    df_meter = pd.read_csv(meter_path, engine='python', on_bad_lines='skip')
     df_meter['timestamp'] = pd.to_datetime(df_meter['timestamp'])
     
     # Load Secondary Meter Data (e.g., Electricity for Internal Heat Gain proxy)
     # This addresses "using all appropriate data types"
     elec_path = os.path.join(base_path, "building-data-genome-project-2", "data", "meters", "cleaned", "electricity_cleaned.csv")
-    df_elec = pd.read_csv(elec_path)
+    df_elec = pd.read_csv(elec_path, engine='python', on_bad_lines='skip')
     df_elec['timestamp'] = pd.to_datetime(df_elec['timestamp'])
     
     # Merge all datasets
@@ -132,6 +132,10 @@ def load_building_data(building_id, site_id, meter_type='chilledwater'):
     occ_proxy = df_merged['total_electricity'] if 'total_electricity' in df_merged.columns else df_merged['power_usage']
     df_merged['indoor_co2'] = 400 + (occ_proxy / occ_proxy.max()) * 600 + np.random.normal(0, 20, len(df_merged))
     
+    # --- PHASE 6: Introduce outdoor_temp explicitly ---
+    if 'airTemperature' in df_merged.columns:
+        df_merged = df_merged.rename(columns={'airTemperature': 'outdoor_temp'})
+        
     return df_merged
 
 if __name__ == "__main__":

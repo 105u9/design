@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, HTTPException, Depends, Security
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
+from fastapi.openapi.utils import get_openapi
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from typing import List, Dict
 import numpy as np
@@ -137,7 +141,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="数据驱动的暖通空调智能控制原型系统 API",
-    docs_url=None, # Disable default so we can override it with custom CSS
+    docs_url=None, # 禁用默认以支持深度定制
+    redoc_url=None, # 禁用默认 redoc
     description="""
 ### 项目背景
 本项目是一个基于数据驱动的空调智能控制系统 API 后端。系统通过集成深度学习（GAT-LSTM）负荷预测与多目标粒子群（MOPSO）优化算法，旨在实现建筑节能与室内热舒适度的双重目标优化。
@@ -161,6 +166,9 @@ app = FastAPI(
         "name": "Graduation Project Developer",
     }
 )
+
+# 2. 【必需功能】添加 GZip 响应压缩支持 (提升返回预测大数据列表时的速度)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # --- CORS Configuration (Cross-Origin Optimization) ---
 app.add_middleware(
@@ -362,15 +370,77 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         return {"access_token": access_token, "token_type": "bearer"}
     raise HTTPException(status_code=400, detail="用户名或密码不正确")
 
-from fastapi.openapi.docs import get_swagger_ui_html
-
+# 3. 【界面与功能优化】增强版 Swagger UI 路由
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html():
     return get_swagger_ui_html(
         openapi_url=app.openapi_url,
-        title=app.title + " - API 文档",
+        title=app.title + " - 交互式 API 文档",
         oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
-        swagger_css_url="/static/swagger-dark.css"
+        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-dark.css",
+        swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png", # 可换成你的毕设系统 Logo
+        swagger_ui_parameters={
+            "persistAuthorization": True,      # 核心优化：刷新页面保留 Token，不用每次重启/刷新重新登录！
+            "displayRequestDuration": True,    # 核心优化：在接口右下角显示请求耗时 (毫秒)，便于分析预测算法延迟
+            "filter": True,                    # 开启顶部接口搜索框，方便快速查找路由
+            "syntaxHighlight.theme": "monokai",# JSON 响应代码块采用暗色主题
+            "docExpansion": "list",            # 默认只展开 Tag 列表，不展开所有接口，页面更清爽
+            "defaultModelsExpandDepth": -1,    # 隐藏页面最底部杂乱的 Pydantic Schemas 模型列表
+        }
+    )
+
+# 4. 【缺失功能】补充 ReDoc 文档 (适合写毕设论文时截图展示只读规范)
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - ReDoc 规范文档",
+    )
+
+# 5. 【功能优化】深度定制 OpenAPI Schema，增加视觉提示
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi(
+        title="暖通空调智能控制云平台 API",
+        version="2.0.0",
+        description="""
+<div style='padding: 15px; background: rgba(0, 240, 255, 0.1); border-left: 4px solid #00f0ff; border-radius: 4px; margin-bottom: 20px;'>
+    <h4 style="margin-top:0; color: #00f0ff;">⚡ 开发者提示 (周杰-计算机222毕业设计)</h4>
+    <b>🔒 鉴权说明：</b> 本系统采用 OAuth2 令牌保护机制。请点击右侧 <code>Authorize</code> 进行授权验证。<br>
+    测试账号：<code>admin</code> &nbsp;|&nbsp; 密码：<code>admin123</code>
+</div>
+""" + app.description,
+        routes=app.routes,
+        tags=tags_metadata,
+    )
+    # 添加顶部 Logo
+    openapi_schema["info"]["x-logo"] = {
+        "url": "https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png" 
+    }
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
+
+# 6. 【缺失的必需功能】系统健康检查探针 (生产环境/Docker部署必备)
+@app.get("/health", tags=["系统管理"], summary="系统健康检查探针", description="用于负载均衡器或 Docker 检查后端服务是否存活。")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "ai_mode": system_state["ai_mode"],
+        "device": str(device)
+    }
+
+# 7. 【缺失的必需功能】全局异常拦截器 (避免报错时后端直接向前端抛出难以解析的纯文本)
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    logger.error(f"系统未捕获异常: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "服务器内部错误，请联系管理员或检查终端日志。", "error": str(exc)}
     )
 
 @app.get("/", tags=["系统配置"], summary="根路径重定向", description="自动重定向到可视化监控大屏页面，方便用户快速查看系统状态")
@@ -714,55 +784,72 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
                 adj_tensor = torch.FloatTensor(adj_matrix).to(device) if adj_matrix is not None else None
                 
                 with torch.no_grad():
-                    preds_scaled = model_instance(input_tensor, adj=adj_tensor)[0].mean(dim=0).cpu().numpy()
+                    preds_scaled = model_instance(input_tensor, adj=adj_tensor)[0].cpu().numpy() # [12, output_size]
                     
-                    # De-normalize load and humidity using metadata order
-                    # Power
-                    d_p = np.zeros((1, len(feature_list)))
+                    real_predicted_load_12 = []
+                    real_predicted_rh_12 = []
+                    real_predicted_temp_12 = []
+                    real_predicted_out_temp_12 = []
+                    
                     p_idx = feature_list.index('power_usage')
-                    d_p[0, p_idx] = preds_scaled[0] 
-                    real_predicted_load = scaler.inverse_transform(d_p)[0, p_idx]
-                    
-                    # Humidity
-                    d_rh = np.zeros((1, len(feature_list)))
                     rh_idx = feature_list.index('indoor_humidity')
-                    d_rh[0, rh_idx] = preds_scaled[2] 
-                    real_predicted_rh = scaler.inverse_transform(d_rh)[0, rh_idx]
-
-                    # Temperature (for dynamic bounds)
-                    d_t = np.zeros((1, len(feature_list)))
                     t_idx = feature_list.index('indoor_temp')
-                    d_t[0, t_idx] = preds_scaled[1] 
-                    real_predicted_temp = scaler.inverse_transform(d_t)[0, t_idx]
+                    out_t_idx = feature_list.index('outdoor_temp') if 'outdoor_temp' in feature_list else feature_list.index('airTemperature')
+                    
+                    for t in range(12):
+                        d_p = np.zeros((1, len(feature_list)))
+                        d_p[0, p_idx] = preds_scaled[t, p_idx]
+                        real_predicted_load_12.append(scaler.inverse_transform(d_p)[0, p_idx])
+                        
+                        d_rh = np.zeros((1, len(feature_list)))
+                        d_rh[0, rh_idx] = preds_scaled[t, rh_idx]
+                        real_predicted_rh_12.append(scaler.inverse_transform(d_rh)[0, rh_idx])
+                        
+                        d_t = np.zeros((1, len(feature_list)))
+                        d_t[0, t_idx] = preds_scaled[t, t_idx]
+                        real_predicted_temp_12.append(scaler.inverse_transform(d_t)[0, t_idx])
+                        
+                        d_out = np.zeros((1, len(feature_list)))
+                        d_out[0, out_t_idx] = preds_scaled[t, out_t_idx]
+                        real_predicted_out_temp_12.append(scaler.inverse_transform(d_out)[0, out_t_idx])
+                        
         except Exception as e:
             logger.error(f"Optimization prediction failed: {e}\n{traceback.format_exc()}")
-            real_predicted_temp = 22.0 
+            real_predicted_temp_12 = [22.0] * 12
+            real_predicted_load_12 = [150.0] * 12
+            real_predicted_rh_12 = [50.0] * 12
+            real_predicted_out_temp_12 = [35.0] * 12
 
-    # --- DYNAMIC BOUNDS OPTIMIZATION (2D: [Temp, WindSpeed]) ---
-    if real_predicted_temp < 18:
-        search_bounds = [[20, 26], [0.1, 1.0]] # Heating mode bounds
-    else:
-        search_bounds = [[18, 26], [0.1, 1.0]] # Cooling mode bounds
+    # --- DYNAMIC BOUNDS OPTIMIZATION (24D: 12 steps * [Temp, WindSpeed]) ---
+    search_bounds = []
+    for t in range(12):
+        if real_predicted_temp_12[t] < 18:
+            search_bounds.extend([[20, 26], [0.1, 1.0]])
+        else:
+            search_bounds.extend([[18, 26], [0.1, 1.0]])
 
     def fitness_func(x):
-        setpoint = x[0]
-        v_speed = x[1]
-        
-        # --- PHASE 6 UPGRADE: Thermodynamics-based Energy Model ---
-        # Q_demand (cooling load proxy): Assume T_out=35C, normalize to baseline 24C
-        q_demand = real_predicted_load * ((max(0, 35.0 - setpoint) / (35.0 - 24.0)) ** 1.2)
-        # COP model: Higher setpoint leads to higher efficiency in cooling
-        cop = 3.0 + 0.1 * (setpoint - 18)
-        # Fan Power model: Proportional to cube of wind speed
-        p_fan = 10.0 * (v_speed ** 3)
-        base_power = 20.0
-        
-        energy = (q_demand / cop) + p_fan + base_power
-        
-        # --- PMV Calculation with dynamic wind speed ---
-        pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=v_speed, m=1.1, icl=0.7)
-        comfort_penalty = (pmv ** 2) * 50.0 
-        return [energy, comfort_penalty]
+        total_e = 0.0
+        total_c = 0.0
+        for t in range(12):
+            setpoint = x[t*2]
+            v_speed = x[t*2+1]
+            
+            out_t = real_predicted_out_temp_12[t]
+            denom = max(1.0, out_t - 24.0)
+            q_demand = real_predicted_load_12[t] * ((max(0, out_t - setpoint) / denom) ** 1.2)
+            cop = 3.0 + 0.1 * (setpoint - 18)
+            p_fan = 10.0 * (v_speed ** 3)
+            base_power = 20.0
+            
+            energy = (q_demand / cop) + p_fan + base_power
+            rh = real_predicted_rh_12[t]
+            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=rh, v=v_speed, m=1.1, icl=0.7)
+            comfort_penalty = (pmv ** 2) * 50.0 
+            
+            total_e += energy
+            total_c += comfort_penalty
+        return [total_e, total_c]
 
     mopso = MOPSO(fitness_func, bounds=search_bounds, num_particles=30, max_iter=20)
     pareto_front = mopso.solve()
@@ -772,7 +859,7 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
     for p in pareto_front:
         sp = p['position'][0]
         v_sp = p['position'][1]
-        pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
+        pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh_12[0], v=v_sp, m=1.1, icl=0.7)
         if abs(pmv_val) <= 0.5:
             acceptable_sols.append(p)
     
@@ -780,7 +867,7 @@ def optimize_control(current_user: dict = Depends(get_current_user)):
         for p in pareto_front:
             sp = p['position'][0]
             v_sp = p['position'][1]
-            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh_12[0], v=v_sp, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.8:
                 acceptable_sols.append(p)
                 

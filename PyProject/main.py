@@ -79,7 +79,7 @@ def run_pipeline():
         # Save metadata (feature order) for API robustness
         metadata = {
             'feature_names': numeric_cols.tolist(),
-            'target_cols': ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2'],
+            'target_cols': ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2', 'outdoor_temp'],
             'input_size': len(numeric_cols)
         }
         joblib.dump(metadata, "src/metadata.pkl")
@@ -114,8 +114,7 @@ def run_pipeline():
         
         # --- PHASE 5 UPGRADE: Weighted MSE Loss ---
         # Prioritize power_usage (index 0) to reduce SMAPE from 63% to a reasonable range.
-        # target_cols = ['power_usage', 'indoor_temp', 'indoor_humidity', 'indoor_co2']
-        loss_weights = torch.tensor([3.0, 1.0, 1.0, 0.5]).to(device)
+        loss_weights = torch.tensor([3.0, 1.0, 1.0, 0.5, 1.0]).to(device)
         
         def weighted_mse_loss(input, target, weights):
             # input/target: [batch, seq, output_size]
@@ -188,55 +187,60 @@ def run_pipeline():
         print("Final scaler saved to src/data_scaler.pkl")
 
         # 3. Optimization Strategy (Phase 4)
-        print("\n[Step 3/4] Running MOPSO optimization (Energy vs Comfort/PMV)...")
+        print("\n[Step 3/4] Running MOPSO optimization (Energy vs Comfort/PMV) over 12-hour horizon...")
         model.eval()
         with torch.no_grad():
-            # Get real recent data for prediction from the end of test set
             last_seq = X_test[-1:].to(device)
-            # Predict for all channels
-            preds_scaled = model(last_seq, adj=adj_tensor)[0] # [12, 4]
+            preds_scaled = model(last_seq, adj=adj_tensor)[0] # [12, output_size]
+            preds_scaled_cpu = preds_scaled.cpu().numpy()
             
-            # Mean predicted values for the next 12 hours
-            avg_preds_scaled = preds_scaled.mean(dim=0).cpu().numpy() # [4]
-            
-            # De-normalize predicted values properly using scaler and metadata
             feature_names = metadata['feature_names']
             target_idxs = [feature_names.index(col) for col in target_cols]
             
-            # De-normalize each target
-            real_preds = {}
-            for i, col in enumerate(target_cols):
-                d_p = np.zeros((1, len(feature_names)))
-                d_p[0, target_idxs[i]] = avg_preds_scaled[i]
-                real_preds[col] = scaler.inverse_transform(d_p)[0, target_idxs[i]]
+            real_preds_12 = {col: [] for col in target_cols}
+            for t in range(12):
+                for i, col in enumerate(target_cols):
+                    d_p = np.zeros((1, len(feature_names)))
+                    d_p[0, target_idxs[i]] = preds_scaled_cpu[t, i]
+                    val = scaler.inverse_transform(d_p)[0, target_idxs[i]]
+                    real_preds_12[col].append(val)
             
-            real_predicted_load = real_preds['power_usage']
-            real_predicted_rh = real_preds['indoor_humidity']
-            real_predicted_temp = real_preds['indoor_temp']
+            real_predicted_load_12 = real_preds_12['power_usage']
+            real_predicted_rh_12 = real_preds_12['indoor_humidity']
+            real_predicted_temp_12 = real_preds_12['indoor_temp']
+            real_predicted_out_temp_12 = real_preds_12['outdoor_temp']
             
-            # --- DYNAMIC BOUNDS OPTIMIZATION (2D: [Temp, WindSpeed]) ---
-            if real_predicted_temp < 18:
-                search_bounds = [[20, 26], [0.1, 1.0]] # Heating range
-            else:
-                search_bounds = [[18, 26], [0.1, 1.0]] # Cooling range
+            search_bounds = []
+            for t in range(12):
+                if real_predicted_temp_12[t] < 18:
+                    search_bounds.extend([[20, 26], [0.1, 1.0]])
+                else:
+                    search_bounds.extend([[18, 26], [0.1, 1.0]])
             
         def hvac_fitness(x):
-            setpoint = x[0]
-            v_speed = x[1]
-            # --- PHASE 6 UPGRADE: Thermodynamics-based Energy Model ---
-            # Q_demand (cooling load proxy), assuming T_out = 35C and baseline T_set = 24C
-            q_demand = real_predicted_load * ((max(0, 35.0 - setpoint) / (35.0 - 24.0)) ** 1.2)
-            cop = 3.0 + 0.1 * (setpoint - 18)
-            p_fan = 10.0 * (v_speed ** 3)
-            base_power = 20.0
+            total_energy = 0.0
+            total_comfort_penalty = 0.0
             
-            energy = (q_demand / cop) + p_fan + base_power
-            
-            # Use dynamic wind speed in PMV
-            pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=real_predicted_rh, v=v_speed, m=1.1, icl=0.7)
-            comfort_penalty = (pmv ** 2) * 50.0 
-            
-            return [energy, comfort_penalty]
+            for t in range(12):
+                setpoint = x[t * 2]
+                v_speed = x[t * 2 + 1]
+                
+                out_t = real_predicted_out_temp_12[t]
+                denom = max(1.0, out_t - 24.0)
+                q_demand = real_predicted_load_12[t] * ((max(0, out_t - setpoint) / denom) ** 1.2)
+                
+                cop = 3.0 + 0.1 * (setpoint - 18)
+                p_fan = 10.0 * (v_speed ** 3)
+                
+                energy = (q_demand / cop) + p_fan + 20.0
+                rh = real_predicted_rh_12[t]
+                pmv = calculate_pmv(ta=setpoint, tr=setpoint + 1.0, rh=rh, v=v_speed, m=1.1, icl=0.7)
+                comfort_penalty = (pmv ** 2) * 50.0 
+                
+                total_energy += energy
+                total_comfort_penalty += comfort_penalty
+                
+            return [total_energy, total_comfort_penalty]
         
         mopso = MOPSO(hvac_fitness, search_bounds, num_particles=30, max_iter=20) 
         pareto = mopso.solve()
@@ -244,9 +248,10 @@ def run_pipeline():
         # --- PHASE 6: Consistent Pareto Selection ---
         acceptable_sols = []
         for p in pareto:
+            # Check the first step PMV as the primary metric for accepting the full sequence
             sp = p['position'][0]
             v_sp = p['position'][1]
-            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
+            pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh_12[0], v=v_sp, m=1.1, icl=0.7)
             if abs(pmv_val) <= 0.5:
                 acceptable_sols.append(p)
         
@@ -254,7 +259,7 @@ def run_pipeline():
             for p in pareto:
                 sp = p['position'][0]
                 v_sp = p['position'][1]
-                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh, v=v_sp, m=1.1, icl=0.7)
+                pmv_val = calculate_pmv(ta=sp, tr=sp + 1.0, rh=real_predicted_rh_12[0], v=v_sp, m=1.1, icl=0.7)
                 if abs(pmv_val) <= 0.8:
                     acceptable_sols.append(p)
         
