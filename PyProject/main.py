@@ -299,11 +299,6 @@ def start_api():
     from api import app
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
 
-def start_trnsys():
-    print("\n=== Starting TRNSYS Bridge (Closed-Loop Control) ===")
-    from trnsys_utils import simulate_trnsys_loop
-    simulate_trnsys_loop(None, None)
-
 def start_mqtt():
     print("\n=== Starting MQTT IoT Sensor Simulation ===")
     from simulate_iot import simulate_iot_publisher
@@ -314,7 +309,6 @@ if __name__ == "__main__":
     parser.add_argument("--run", action="store_true", help="Run full pipeline")
     parser.add_argument("--api", action="store_true", help="Start backend API")
     parser.add_argument("--mqtt", action="store_true", help="Start MQTT IoT Simulation")
-    parser.add_argument("--trnsys", action="store_true", help="Start TRNSYS Bridge")
     
     args = parser.parse_args()
     
@@ -324,13 +318,10 @@ if __name__ == "__main__":
         start_api()
     elif args.mqtt:
         start_mqtt()
-    elif args.trnsys:
-        start_trnsys()
     else:
         print("Usage:")
         print("  python main.py --run      # Run training and backtest")
         print("  python main.py --api      # Start backend and dashboard")
         print("  python main.py --mqtt     # Start MQTT IoT simulation")
-        print("  python main.py --trnsys   # Start TRNSYS bridge")
         # Default to run pipeline if no args provided to avoid confusion
         run_pipeline()
