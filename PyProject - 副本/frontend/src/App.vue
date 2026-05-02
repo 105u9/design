@@ -1,5 +1,14 @@
 <template>
-  <div>
+  <div class="app-wrapper">
+    <!-- Navigation Tabs -->
+    <div class="nav-tabs glass">
+      <button class="nav-btn" :class="{ active: currentTab === 'main' }" @click="currentTab = 'main'">系统核心监控大屏</button>
+      <button class="nav-btn" :class="{ active: currentTab === 'loadtest' }" @click="currentTab = 'loadtest'">并发负载性能测试</button>
+      <button class="nav-btn" :class="{ active: currentTab === 'chaos' }" @click="currentTab = 'chaos'">容错与混沌工程演练</button>
+    </div>
+
+    <!-- Main View -->
+    <div v-if="currentTab === 'main'">
     <!-- Header -->
     <div class="header glass">
         <div>
@@ -10,6 +19,13 @@
             </div>
         </div>
         <div class="switch-container">
+            <span class="status-text">控制平面对接状态</span>
+            <div class="status-indicator" style="margin-right: 15px;">
+                <div :class="connectionError ? 'inactive-dot' : 'active-dot'"></div>
+                <span :style="{ color: connectionError ? 'var(--danger)' : 'var(--neon-green)' }">
+                  {{ connectionError ? "后端服务离线" : "API 链路正常" }}
+                </span>
+            </div>
             <span class="status-text">AI 优化闭环控制</span>
             <label class="switch">
                 <input type="checkbox" v-model="isAiEnabled" @change="toggleAi">
@@ -73,6 +89,15 @@
             <v-chart class="chart-container" :option="predictChartOption" autoresize />
         </div>
     </div>
+    </div>
+
+    <!-- Sandboxes -->
+    <div v-else-if="currentTab === 'loadtest'" class="sandbox-view-wrapper">
+      <LoadTestSandbox />
+    </div>
+    <div v-else-if="currentTab === 'chaos'" class="sandbox-view-wrapper">
+      <ChaosSandbox />
+    </div>
   </div>
 </template>
 
@@ -80,6 +105,8 @@
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import VChart from 'vue-echarts'
+import LoadTestSandbox from './components/LoadTestSandbox.vue'
+import ChaosSandbox from './components/ChaosSandbox.vue'
 import { use } from 'echarts/core'
 import { 
   LineChart, BarChart, ScatterChart, GaugeChart 
@@ -96,8 +123,10 @@ use([
   CanvasRenderer
 ])
 
+const currentTab = ref('main')
 const isAiEnabled = ref(true)
 const token = ref('')
+const connectionError = ref(false)
 
 const latestStats = reactive({
   temp: '--.-',
@@ -142,9 +171,13 @@ const login = async () => {
     // Using relative path so it hits Vite proxy -> Fast API
     const res = await axios.post('/token', fd)
     token.value = res.data.access_token
+    connectionError.value = false
     startPolling()
   } catch (error) {
-    console.error('Login failed', error)
+    console.error('Login failed (Backend may be offline)', error)
+    connectionError.value = true
+    // Still start polling to recover when backend comes back online
+    startPolling()
   }
 }
 
@@ -177,8 +210,12 @@ const fetchData = async () => {
       latestStats.hum = last.humidity.toFixed(1)
       latestStats.power = last.power.toFixed(1)
       updateCharts(history, predData, optData)
+      connectionError.value = false
     }
-  } catch (err) { console.error('Fetch error:', err) }
+  } catch (err) { 
+    console.error('Fetch error: Backend API unreachable.', err)
+    connectionError.value = true
+  }
 }
 
 const updateCharts = (history: any[], prediction: any, optimization: any) => {
@@ -336,6 +373,22 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* Navigation Tabs */
+.app-wrapper { display: flex; flex-direction: column; min-height: 100vh; padding: 20px; box-sizing: border-box; }
+.nav-tabs { display: flex; gap: 15px; margin-bottom: 20px; padding: 10px 20px; border-radius: 12px; }
+.nav-btn { 
+  background: transparent; border: 1px solid rgba(255,255,255,0.1); color: #94a3b8; 
+  padding: 10px 20px; border-radius: 8px; font-family: 'Outfit'; font-size: 1rem; 
+  cursor: pointer; transition: all 0.3s; 
+}
+.nav-btn:hover { background: rgba(255,255,255,0.05); color: #fff; }
+.nav-btn.active { 
+  background: rgba(0, 240, 255, 0.1); border-color: var(--neon-blue); color: var(--neon-blue); 
+  box-shadow: 0 0 15px rgba(0, 240, 255, 0.2); 
+}
+
+.sandbox-view-wrapper { flex-grow: 1; display: flex; flex-direction: column; }
+
 /* Specific Component View Styles */
 .header { 
   display: flex; justify-content: space-between; align-items: center; 
