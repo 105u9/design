@@ -1,0 +1,68 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Phase 6: TRNSYS Joint Simulation (Simplified Logic)
+
+
+class TRNSYSSimulator:
+    def __init__(self, dt=3600):
+        self.dt = dt
+        self.current_time = 0
+        self.internal_temp = 25.0
+        self.ambient_temp_profile = [20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 28.0, 26.0, 24.0, 22.0, 20.0, 18.0] * 2
+        
+    def step(self, supply_air_setpoint):
+        # Simulating thermal dynamics (Newton's cooling law simplification)
+        # T_next = T_curr + k1 * (T_ambient - T_curr) + k2 * (T_supply - T_curr)
+        k1, k2 = 0.1, 0.5
+        ambient_temp = self.ambient_temp_profile[self.current_time % 24]
+        
+        self.internal_temp += k1 * (ambient_temp - self.internal_temp) + k2 * (supply_air_setpoint - self.internal_temp)
+        self.current_time += 1
+        return self.internal_temp
+
+# Phase 6: Strategy Comparison
+def compare_strategies(steps=24):
+    sim_pid = TRNSYSSimulator()
+    sim_ai = TRNSYSSimulator()
+    
+    results_pid = []
+    results_ai = []
+    
+    # PID (Fixed setpoint)
+    fixed_setpoint = 22.0
+    for _ in range(steps):
+        temp = sim_pid.step(fixed_setpoint)
+        results_pid.append(temp)
+        
+    # AI (Dynamic setpoint using MOPSO-like optimization)
+    # For now, simulate AI-based setpoint adjustments
+    for _ in range(steps):
+        # Dynamic adjustment based on ambient conditions
+        ambient = sim_ai.ambient_temp_profile[sim_ai.current_time % 24]
+        ai_setpoint = 22.0 + 0.5 * (ambient - 24.0) # Simplified AI logic
+        temp = sim_ai.step(ai_setpoint)
+        results_ai.append(temp)
+        
+    # Energy estimation: Power = sum(|T_supply - T_ambient|)
+    # This is a simplified energy model for demonstration
+    energy_pid = sum(abs(fixed_setpoint - np.array(sim_pid.ambient_temp_profile[:steps])))
+    energy_ai = sum(abs(np.array([22.0 + 0.5 * (a - 24.0) for a in sim_ai.ambient_temp_profile[:steps]]) - np.array(sim_ai.ambient_temp_profile[:steps])))
+    
+    saving = (energy_pid - energy_ai) / energy_pid * 100
+    print(f"Energy Saving: {saving:.2f}%")
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(results_pid, label='PID (Fixed)')
+    plt.plot(results_ai, label='AI (Dynamic)')
+    plt.axhline(22.0, color='r', linestyle='--', label='Setpoint')
+    plt.title('Internal Temperature Comparison')
+    plt.xlabel('Hours')
+    plt.ylabel('Temperature (C)')
+    plt.legend()
+    plt.savefig('src/simulation_results.png')
+    print("Simulation plot saved as 'src/simulation_results.png'.")
+
+if __name__ == "__main__":
+    compare_strategies()
